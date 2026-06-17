@@ -17,7 +17,9 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Footer, Header, Label, TabbedContent, TabPane
+from textual.containers import VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Label, Static, TabbedContent, TabPane
 
 ALIASES_FILE   = Path.home() / ".bash_aliases"
 FUNCTIONS_FILE = Path.home() / ".bash_functions"
@@ -294,7 +296,13 @@ def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
         for dirpath, dirnames, filenames in os.walk(root):
             d = Path(dirpath)
             depth = len(d.relative_to(root).parts)
-            dirnames[:] = [n for n in dirnames if n not in _PROJECT_SCAN_PRUNE]
+            # Ignore les noms connus + tout répertoire qui est lui-même un venv
+            # (pyvenv.cfg), peu importe son nom, pour ne pas remonter de "projets"
+            # qui sont en fait des paquets installés dans un environnement virtuel.
+            dirnames[:] = [
+                n for n in dirnames
+                if n not in _PROJECT_SCAN_PRUNE and not (d / n / "pyvenv.cfg").exists()
+            ]
             if depth >= max_depth:
                 dirnames[:] = []
             if "pyproject.toml" not in filenames:
@@ -396,6 +404,40 @@ def tool_structure_summary(venv_dir: str, limit: int = 60) -> str:
     return text
 
 
+_TREE_NO_DESCEND = {"site-packages", "__pycache__", ".git", "node_modules",
+                    ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+
+
+def render_dir_tree(root: Path, max_depth: int = 3, max_per_dir: int = 40) -> str:
+    """Arbre ASCII du répertoire d'installation, bridé pour rester lisible
+    (ne descend pas dans site-packages/__pycache__ etc., ni au-delà de max_depth)."""
+    lines: list[str] = [str(root)]
+
+    def walk(dir_: Path, prefix: str, depth: int) -> None:
+        try:
+            children = sorted(dir_.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except OSError:
+            return
+        children = [c for c in children if c.name not in _SITE_PKG_NOISE]
+        shown = children[:max_per_dir]
+        hidden = len(children) - len(shown)
+        for i, child in enumerate(shown):
+            last = (i == len(shown) - 1) and hidden == 0
+            branch = "└─ " if last else "├─ "
+            label = child.name + ("/" if child.is_dir() else "")
+            lines.append(f"{prefix}{branch}{label}")
+            if child.is_dir() and depth < max_depth and child.name not in _TREE_NO_DESCEND:
+                walk(child, prefix + ("   " if last else "│  "), depth + 1)
+        if hidden > 0:
+            lines.append(f"{prefix}└─ … ({hidden} de plus)")
+
+    if root.is_dir():
+        walk(root, "", 1)
+    else:
+        lines.append("(répertoire introuvable)")
+    return "\n".join(lines)
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def man_target(cmd: str) -> str:
@@ -428,6 +470,44 @@ def _sec_row(title: str) -> tuple:
         bar,
         "",
     )
+
+
+# ─── Overlay : arbre du répertoire d'installation ──────────────────────────────
+
+class DirTreeOverlay(ModalScreen):
+    """Affiche l'arbre du répertoire d'un outil/projet par-dessus la liste."""
+
+    BINDINGS = [
+        Binding("t",      "dismiss_overlay", "Fermer", show=True),
+        Binding("escape", "dismiss_overlay", "Fermer", show=True),
+        Binding("q",      "dismiss_overlay", "Fermer", show=False),
+    ]
+
+    CSS = """
+    DirTreeOverlay { align: center middle; }
+    #tree-panel {
+        width: 92%;
+        height: 85%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #tree-title { text-style: bold; color: $accent; padding-bottom: 1; }
+    """
+
+    def __init__(self, title: str, tree_text: str) -> None:
+        super().__init__()
+        self._title = title
+        self._tree_text = tree_text
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="tree-panel"):
+            yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
+                         f"[dim]( t / Échap pour fermer )[/dim]", id="tree-title")
+            yield Static(self._tree_text)
+
+    def action_dismiss_overlay(self) -> None:
+        self.dismiss()
 
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
@@ -471,7 +551,7 @@ class AliasMenu(App):
         Binding("space",      "run_entry",  "▶ Lancer",     show=True),
         Binding("h",          "show_help",  "? Man/Help",   show=True),
         Binding("r",          "reload",     "Recharger",    show=True),
-        Binding("t",          "toggle_view",   "Liste/Arbre",   show=True),
+        Binding("t",          "toggle_view",   "Arbre du dossier",   show=True),
         Binding("s",          "toggle_detail", "État/Structure", show=True),
         # Changement d'onglet — priority=True pour passer avant le DataTable
         Binding("ctrl+right", "next_tab",   "Onglet →",     show=True,  priority=True),
@@ -499,7 +579,6 @@ class AliasMenu(App):
         self.tools_entries: list[dict] = []
         self._tool_rows: list[dict | None] = []
         self._tools_loaded = False
-        self._tools_view_mode = "list"
         self._tools_detail = False
         self._init_tools_placeholder()
         self.query_one("#alias-table", DataTable).focus()
@@ -548,7 +627,7 @@ class AliasMenu(App):
                 self._load_tools()
                 self._tools_loaded = True
             n = len(self.tools_entries)
-            self._status(f"{n} point(s) d'entrée  ·  uv tool install + {UV_PROJECT_DIRS[0]}  ·  [t] liste/arbre  [s] détails")
+            self._status(f"{n} point(s) d'entrée  ·  uv tool install + {UV_PROJECT_DIRS[0]}  ·  [t] arbre du dossier  [s] détails")
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -607,63 +686,40 @@ class AliasMenu(App):
         detail = self._tools_detail
         self._tool_rows = []
 
-        if self._tools_view_mode == "tree":
-            info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Répertoire d'installation")
-            t.add_columns("  ▶ Run  ", "  ? Man  ", "Arborescence d'installation", info1_h, info2_h)
-            current_source = None
-            current_tool = None
-            for e in self.tools_entries:
-                if e["source"] != current_source:
-                    current_source = e["source"]
-                    current_tool = None
-                    label = self._SOURCE_LABELS.get(current_source) or current_source or ""
-                    t.add_row(*_sec_row(label), key=f"tsh{len(self._tool_rows)}")
-                    self._tool_rows.append(None)
-                if e["tool"] != current_tool:
-                    current_tool = e["tool"]
-                    if detail:
-                        info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
-                    else:
-                        info1, info2 = e["python"], e["tool_dir"]
-                    t.add_row(
-                        "", "",
-                        f"[bold bright_cyan]◆ {e['tool']}[/bold bright_cyan] [dim]v{e['version']}[/dim]",
-                        f"[dim]{info1}[/dim]",
-                        f"[dim]{info2}[/dim]",
-                        key=f"th{len(self._tool_rows)}",
-                    )
-                    self._tool_rows.append(None)
-                entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
+        info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Chemin")
+        t.add_columns("  ▶ Run  ", "  ? Man  ", "Source", "Outil", "Point d'entrée", info1_h, info2_h)
+
+        current_source = None
+        for e in self.tools_entries:
+            if e["source"] != current_source:
+                current_source = e["source"]
+                label = self._SOURCE_LABELS.get(current_source) or current_source or ""
                 t.add_row(
-                    "[bold green] [SPC] [/bold green]",
-                    "[bold cyan]  [H]  [/bold cyan]",
-                    f"   [yellow]├─ {entry_label}[/yellow]",
-                    "",
-                    f"[dim]{e['path']}[/dim]",
-                    key=f"te{len(self._tool_rows)}",
+                    "", "",
+                    f"[bold bright_cyan]  ◆  {label}[/bold bright_cyan]",
+                    "[dim cyan]" + "─" * 38 + "[/dim cyan]",
+                    "", "", "",
+                    key=f"tsh{len(self._tool_rows)}",
                 )
-                self._tool_rows.append(e)
-        else:
-            info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Chemin")
-            t.add_columns("  ▶ Run  ", "  ? Man  ", "Source", "Outil", "Point d'entrée", info1_h, info2_h)
-            for e in self.tools_entries:
-                if detail:
-                    info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
-                else:
-                    info1, info2 = e["python"], e["path"]
-                source_cell = "[dim]uv tool[/dim]" if e["source"] == "uv-tool" else "[dim]projet[/dim]"
-                entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
-                t.add_row(
-                    "[bold green] [SPC] [/bold green]",
-                    "[bold cyan]  [H]  [/bold cyan]",
-                    source_cell,
-                    f"[bold yellow]{e['tool']}[/bold yellow]",
-                    entry_label,
-                    f"[dim]{info1}[/dim]",
-                    f"[dim]{info2}[/dim]",
-                    key=f"t{len(self._tool_rows)}",
-                )
-                self._tool_rows.append(e)
+                self._tool_rows.append(None)
+
+            if detail:
+                info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
+            else:
+                info1, info2 = e["python"], e["path"]
+            source_cell = "[dim]uv tool[/dim]" if e["source"] == "uv-tool" else "[dim]projet[/dim]"
+            entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
+            t.add_row(
+                "[bold green] [SPC] [/bold green]",
+                "[bold cyan]  [H]  [/bold cyan]",
+                source_cell,
+                f"[bold yellow]{e['tool']}[/bold yellow]",
+                entry_label,
+                f"[dim]{info1}[/dim]",
+                f"[dim]{info2}[/dim]",
+                key=f"t{len(self._tool_rows)}",
+            )
+            self._tool_rows.append(e)
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -809,9 +865,13 @@ class AliasMenu(App):
     def action_toggle_view(self) -> None:
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
-        self._tools_view_mode = "tree" if self._tools_view_mode == "list" else "list"
-        self._render_tools_table()
-        self._status(f"Vue : {self._tools_view_mode}")
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne un outil/projet pour voir son arbre d'installation")
+            return
+        target_dir = Path(entry["tool_dir"])
+        title = f"◆ {entry['tool']}  —  {target_dir}"
+        self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
 
     def action_toggle_detail(self) -> None:
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
