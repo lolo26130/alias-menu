@@ -19,6 +19,7 @@ from textual.widgets import DataTable, Footer, Header, Label, TabbedContent, Tab
 
 ALIASES_FILE   = Path.home() / ".bash_aliases"
 FUNCTIONS_FILE = Path.home() / ".bash_functions"
+UV_TOOLS_DIR   = Path.home() / ".local" / "share" / "uv" / "tools"
 
 # Séparateurs lourds (===) → titres de section ; légers (---) → ignorés
 _HEAVY_SEP_RE = re.compile(r"^=+$")
@@ -27,8 +28,11 @@ _ALIAS_RE     = re.compile(r"^alias\s+(\S+?)=(['\"])(.*)\2\s*(?:#.*)?$")
 _ALIAS_NQ_RE  = re.compile(r"^alias\s+(\S+?)=(.*)")
 _FUNC_DEF_RE  = re.compile(r"^(?:function\s+)?([a-zA-Z_]\w*)\s*\(\s*\)\s*\{?\s*$")
 _HAS_ARGS_RE  = re.compile(r'\$[1-9@*]|\$\{[1-9]\}')
+_TOOL_HEADER_RE = re.compile(r"^(\S+)\s+v(\S+)\s+\[(.*?)\]\s+\((.*?)\)$")
+_TOOL_ENTRY_RE  = re.compile(r"^-\s+(\S+)\s+\((.*?)\)$")
+_SITE_PKG_NOISE = {"__pycache__", "_virtualenv.py", "_virtualenv.pth"}
 
-TAB_IDS = ["tab-alias", "tab-func"]
+TAB_IDS = ["tab-alias", "tab-func", "tab-tools"]
 
 
 # ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -199,6 +203,80 @@ def parse_functions(path: Path) -> list[dict]:
     return entries
 
 
+def parse_uv_tools() -> list[dict]:
+    """Liste les points d'entrée des outils installés via `uv tool install`."""
+    entries: list[dict] = []
+    try:
+        result = subprocess.run(
+            ["uv", "tool", "list", "--show-paths", "--show-python"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return entries
+    if result.returncode != 0:
+        return entries
+
+    current: dict | None = None
+    for raw in result.stdout.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        m_header = _TOOL_HEADER_RE.match(line)
+        if m_header:
+            current = {
+                "tool":     m_header.group(1),
+                "version":  m_header.group(2),
+                "python":   m_header.group(3),
+                "tool_dir": m_header.group(4),
+            }
+            continue
+        m_entry = _TOOL_ENTRY_RE.match(line)
+        if m_entry and current:
+            entries.append({
+                "type":     "tool",
+                "tool":     current["tool"],
+                "version":  current["version"],
+                "python":   current["python"],
+                "tool_dir": current["tool_dir"],
+                "name":     m_entry.group(1),
+                "path":     m_entry.group(2),
+            })
+
+    return entries
+
+
+def tool_install_state(e: dict) -> str:
+    """'uv' si le point d'entrée est un symlink dans le venv de l'outil, sinon 'pip'."""
+    try:
+        resolved = Path(e["path"]).resolve()
+        base = Path(e["tool_dir"]).resolve()
+        resolved.relative_to(base)
+        return "uv"
+    except (OSError, ValueError):
+        return "pip"
+
+
+def tool_structure_summary(tool_dir: str, limit: int = 60) -> str:
+    """Résumé du contenu de site-packages pour l'outil installé dans tool_dir."""
+    lib = Path(tool_dir) / "lib"
+    site_packages = None
+    if lib.is_dir():
+        for py_dir in sorted(lib.glob("python3.*")):
+            candidate = py_dir / "site-packages"
+            if candidate.is_dir():
+                site_packages = candidate
+                break
+    if site_packages is None:
+        return "(structure introuvable)"
+
+    names = sorted(p.name for p in site_packages.iterdir() if p.name not in _SITE_PKG_NOISE)
+    pretty = [n + "/" if (site_packages / n).is_dir() else n for n in names]
+    text = ", ".join(pretty) if pretty else "(vide)"
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip(", ") + "…"
+    return text
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def man_target(cmd: str) -> str:
@@ -274,6 +352,8 @@ class AliasMenu(App):
         Binding("space",      "run_entry",  "▶ Lancer",     show=True),
         Binding("h",          "show_help",  "? Man/Help",   show=True),
         Binding("r",          "reload",     "Recharger",    show=True),
+        Binding("t",          "toggle_view",   "Liste/Arbre",   show=True),
+        Binding("s",          "toggle_detail", "État/Structure", show=True),
         # Changement d'onglet — priority=True pour passer avant le DataTable
         Binding("ctrl+right", "next_tab",   "Onglet →",     show=True,  priority=True),
         Binding("ctrl+left",  "prev_tab",   "← Onglet",     show=True,  priority=True),
@@ -289,13 +369,27 @@ class AliasMenu(App):
                 yield DataTable(id="alias-table", zebra_stripes=True, cursor_type="row")
             with TabPane("  Fonctions  ", id="tab-func"):
                 yield DataTable(id="func-table", zebra_stripes=True, cursor_type="row")
+            with TabPane("  Outils uv  ", id="tab-tools"):
+                yield DataTable(id="tools-table", zebra_stripes=True, cursor_type="row")
         yield Label("", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
         self._load_aliases()
         self._load_functions()
+        self.tools_entries: list[dict] = []
+        self._tool_rows: list[dict | None] = []
+        self._tools_loaded = False
+        self._tools_view_mode = "list"
+        self._tools_detail = False
+        self._init_tools_placeholder()
         self.query_one("#alias-table", DataTable).focus()
+
+    def _init_tools_placeholder(self) -> None:
+        t = self.query_one("#tools-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("  ▶ Run  ", "  ? Man  ", "Outil", "Point d'entrée", "Python", "Chemin")
+        t.add_row("", "", "[dim]Active cet onglet pour lancer la recherche (uv tool list)…[/dim]", "", "", "")
 
     # ── tab switching ────────────────────────────────────────────────────────
 
@@ -319,14 +413,23 @@ class AliasMenu(App):
     # TabbedContent.active est un reactive → cet event se déclenche sur changement
     def on_tabbed_content_tab_activated(self, _: TabbedContent.TabActivated) -> None:
         # Utilise tc.active (fiable) plutôt que event.tab.id (préfixé en interne)
-        if self._active_tab() == "tab-alias":
+        active = self._active_tab()
+        if active == "tab-alias":
             self.query_one("#alias-table", DataTable).focus()
             n = sum(1 for e in getattr(self, "alias_entries", []) if e["type"] != "section")
             self._status(f"{n} alias  ·  {ALIASES_FILE}")
-        else:
+        elif active == "tab-func":
             self.query_one("#func-table", DataTable).focus()
             n = sum(1 for e in getattr(self, "func_entries", []) if e["type"] != "section")
             self._status(f"{n} fonctions  ·  {FUNCTIONS_FILE}")
+        else:
+            self.query_one("#tools-table", DataTable).focus()
+            if not self._tools_loaded:
+                self._status("Recherche des outils installés via uv…")
+                self._load_tools()
+                self._tools_loaded = True
+            n = len(self.tools_entries)
+            self._status(f"{n} point(s) d'entrée  ·  uv tool list  ·  [t] liste/arbre  [s] détails")
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -370,21 +473,90 @@ class AliasMenu(App):
                     key=f"f{i}",
                 )
 
+    def _load_tools(self) -> None:
+        self.tools_entries = parse_uv_tools()
+        self._render_tools_table()
+
+    def _render_tools_table(self) -> None:
+        t = self.query_one("#tools-table", DataTable)
+        t.clear(columns=True)
+        detail = self._tools_detail
+        self._tool_rows = []
+
+        if self._tools_view_mode == "tree":
+            info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Répertoire d'installation")
+            t.add_columns("  ▶ Run  ", "  ? Man  ", "Arborescence d'installation", info1_h, info2_h)
+            current_tool = None
+            for e in self.tools_entries:
+                if e["tool"] != current_tool:
+                    current_tool = e["tool"]
+                    if detail:
+                        info1, info2 = tool_install_state(e), tool_structure_summary(e["tool_dir"])
+                    else:
+                        info1, info2 = e["python"], e["tool_dir"]
+                    t.add_row(
+                        "", "",
+                        f"[bold bright_cyan]◆ {e['tool']}[/bold bright_cyan] [dim]v{e['version']}[/dim]",
+                        f"[dim]{info1}[/dim]",
+                        f"[dim]{info2}[/dim]",
+                        key=f"th{len(self._tool_rows)}",
+                    )
+                    self._tool_rows.append(None)
+                t.add_row(
+                    "[bold green] [SPC] [/bold green]",
+                    "[bold cyan]  [H]  [/bold cyan]",
+                    f"   [yellow]├─ {e['name']}[/yellow]",
+                    "",
+                    f"[dim]{e['path']}[/dim]",
+                    key=f"te{len(self._tool_rows)}",
+                )
+                self._tool_rows.append(e)
+        else:
+            info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Chemin (~/.local/bin)")
+            t.add_columns("  ▶ Run  ", "  ? Man  ", "Outil", "Point d'entrée", info1_h, info2_h)
+            for e in self.tools_entries:
+                if detail:
+                    info1, info2 = tool_install_state(e), tool_structure_summary(e["tool_dir"])
+                else:
+                    info1, info2 = e["python"], e["path"]
+                t.add_row(
+                    "[bold green] [SPC] [/bold green]",
+                    "[bold cyan]  [H]  [/bold cyan]",
+                    f"[bold yellow]{e['tool']}[/bold yellow]",
+                    e["name"],
+                    f"[dim]{info1}[/dim]",
+                    f"[dim]{info2}[/dim]",
+                    key=f"t{len(self._tool_rows)}",
+                )
+                self._tool_rows.append(e)
+
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _status(self, msg: str) -> None:
         self.query_one("#status", Label).update(msg)
 
     def _current(self) -> dict | None:
-        """Retourne l'entrée sous le curseur, ou None si c'est une section."""
-        if self._active_tab() == "tab-alias":
+        """Retourne l'entrée sous le curseur, ou None si c'est une section/en-tête."""
+        active = self._active_tab()
+        if active == "tab-alias":
             t, entries = self.query_one("#alias-table", DataTable), self.alias_entries
-        else:
+            row = t.cursor_row
+            if 0 <= row < len(entries):
+                e = entries[row]
+                return None if e["type"] == "section" else e
+            return None
+        if active == "tab-func":
             t, entries = self.query_one("#func-table", DataTable), self.func_entries
+            row = t.cursor_row
+            if 0 <= row < len(entries):
+                e = entries[row]
+                return None if e["type"] == "section" else e
+            return None
+
+        t = self.query_one("#tools-table", DataTable)
         row = t.cursor_row
-        if 0 <= row < len(entries):
-            e = entries[row]
-            return None if e["type"] == "section" else e
+        if 0 <= row < len(self._tool_rows):
+            return self._tool_rows[row]
         return None
 
     # ── action : run ────────────────────────────────────────────────────────
@@ -395,8 +567,10 @@ class AliasMenu(App):
             return
         if entry["type"] == "alias":
             self._run_alias(entry)
-        else:
+        elif entry["type"] == "func":
             self._run_function(entry)
+        else:
+            self._run_tool(entry)
 
     def _run_alias(self, e: dict) -> None:
         self._status(f"Lancement : {e['name']}  →  {e['cmd']}")
@@ -432,6 +606,23 @@ class AliasMenu(App):
                     subprocess.run(["bash", "-i", "-c", cmd])
                     input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
 
+    def _run_tool(self, e: dict) -> None:
+        name = e["name"]
+        self._status(f"{name} — tapez des arguments si besoin, puis Entrée")
+        with self.suspend():
+            print(f"\n\033[1;32m▶  {name}\033[0m  \033[2m({e['tool']} v{e['version']})\033[0m\n{'─'*60}")
+            readline.set_startup_hook(lambda: readline.insert_text(f"{name} "))
+            try:
+                cmd = input("\033[1;33m$ \033[0m")
+            except (EOFError, KeyboardInterrupt):
+                cmd = ""
+            finally:
+                readline.set_startup_hook(None)
+            if cmd.strip():
+                print()
+                subprocess.run(["bash", "-i", "-c", cmd])
+                input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+
     # ── action : man / help ─────────────────────────────────────────────────
 
     def action_show_help(self) -> None:
@@ -446,7 +637,7 @@ class AliasMenu(App):
             self._status(f"Manuel : {target}")
             with self.suspend():
                 show_man_or_help(target)
-        else:
+        elif entry["type"] == "func":
             name = entry["name"]
             self._status(f"Corps de la fonction : {name}")
             with self.suspend():
@@ -457,12 +648,35 @@ class AliasMenu(App):
                 )
                 body = entry["body"] or "(corps vide)"
                 subprocess.run(["less", "-R"], input=(header + body + "\n").encode())
+        else:
+            name = entry["name"]
+            self._status(f"Manuel : {name}")
+            with self.suspend():
+                show_man_or_help(name)
+
+    # ── action : vues de l'onglet Outils uv ─────────────────────────────────
+
+    def action_toggle_view(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        self._tools_view_mode = "tree" if self._tools_view_mode == "list" else "list"
+        self._render_tools_table()
+        self._status(f"Vue : {self._tools_view_mode}")
+
+    def action_toggle_detail(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        self._tools_detail = not self._tools_detail
+        self._render_tools_table()
+        self._status("Détails : " + ("état + structure" if self._tools_detail else "python + chemin"))
 
     # ── action : reload ─────────────────────────────────────────────────────
 
     def action_reload(self) -> None:
         self._load_aliases()
         self._load_functions()
+        if self._tools_loaded:
+            self._load_tools()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
