@@ -8,9 +8,11 @@ Alias & Functions Browser — menu TUI style DietPi
 Lancement : uv run ~/scripts/aliases_menu.py   ou   am
 """
 
+import os
 import re
 import readline
 import subprocess
+import tomllib
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -20,6 +22,14 @@ from textual.widgets import DataTable, Footer, Header, Label, TabbedContent, Tab
 ALIASES_FILE   = Path.home() / ".bash_aliases"
 FUNCTIONS_FILE = Path.home() / ".bash_functions"
 UV_TOOLS_DIR   = Path.home() / ".local" / "share" / "uv" / "tools"
+# Arborescences scannées pour trouver des projets gérés par uv (pyproject.toml + uv.lock).
+# Ajoute d'autres répertoires ici si besoin.
+UV_PROJECT_DIRS = [Path.home() / "Documents" / "Python"]
+_PROJECT_SCAN_PRUNE = {
+    ".venv", "venv", "__pycache__", ".git", "node_modules",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
+    "build", "dist", ".tox", ".idea", ".ipynb_checkpoints", ".cache",
+}
 
 # Séparateurs lourds (===) → titres de section ; légers (---) → ignorés
 _HEAVY_SEP_RE = re.compile(r"^=+$")
@@ -203,8 +213,8 @@ def parse_functions(path: Path) -> list[dict]:
     return entries
 
 
-def parse_uv_tools() -> list[dict]:
-    """Liste les points d'entrée des outils installés via `uv tool install`."""
+def _parse_uv_tool_installs() -> list[dict]:
+    """Liste les points d'entrée des outils installés globalement via `uv tool install`."""
     entries: list[dict] = []
     try:
         result = subprocess.run(
@@ -234,31 +244,140 @@ def parse_uv_tools() -> list[dict]:
         if m_entry and current:
             entries.append({
                 "type":     "tool",
+                "source":   "uv-tool",
                 "tool":     current["tool"],
                 "version":  current["version"],
                 "python":   current["python"],
                 "tool_dir": current["tool_dir"],
+                "venv_dir": current["tool_dir"],
                 "name":     m_entry.group(1),
                 "path":     m_entry.group(2),
+                "is_root":  False,
             })
 
     return entries
 
 
+def _is_uv_project(dir_: Path, pyproject_text: str) -> bool:
+    """Un projet est considéré 'uv' s'il a un uv.lock, une section [tool.uv], ou un venv créé par uv."""
+    if (dir_ / "uv.lock").exists():
+        return True
+    if "[tool.uv]" in pyproject_text:
+        return True
+    cfg = dir_ / ".venv" / "pyvenv.cfg"
+    if cfg.exists():
+        try:
+            return "uv" in cfg.read_text().lower()
+        except OSError:
+            return False
+    return False
+
+
+def _venv_python_version(venv_dir: Path) -> str:
+    cfg = venv_dir / "pyvenv.cfg"
+    if not cfg.exists():
+        return ""
+    for line in cfg.read_text().splitlines():
+        if line.strip().startswith("version"):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
+    """Scanne des arborescences (par défaut ~/Documents/Python) à la recherche de
+    projets gérés par uv (pyproject.toml + uv.lock / [tool.uv] / venv créé par uv),
+    et en extrait les points d'entrée déclarés dans [project.scripts]."""
+    entries: list[dict] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            d = Path(dirpath)
+            depth = len(d.relative_to(root).parts)
+            dirnames[:] = [n for n in dirnames if n not in _PROJECT_SCAN_PRUNE]
+            if depth >= max_depth:
+                dirnames[:] = []
+            if "pyproject.toml" not in filenames:
+                continue
+
+            try:
+                text = (d / "pyproject.toml").read_text()
+            except OSError:
+                continue
+            if not _is_uv_project(d, text):
+                continue
+
+            try:
+                data = tomllib.loads(text)
+            except tomllib.TOMLDecodeError:
+                data = {}
+            project = data.get("project", {})
+            name = project.get("name", d.name)
+            version = project.get("version", "")
+            venv_dir = d / ".venv"
+            python = _venv_python_version(venv_dir) if venv_dir.exists() else ""
+
+            scripts: dict = {}
+            scripts.update(project.get("scripts", {}) or {})
+            scripts.update(project.get("gui-scripts", {}) or {})
+
+            if scripts:
+                for script_name in scripts:
+                    exe = venv_dir / "bin" / script_name
+                    entries.append({
+                        "type":     "tool",
+                        "source":   "project",
+                        "tool":     name,
+                        "version":  version,
+                        "python":   python,
+                        "tool_dir": str(d),
+                        "venv_dir": str(venv_dir),
+                        "name":     script_name,
+                        "path":     str(exe) if exe.exists() else "(non installé — uv sync requis)",
+                        "is_root":  False,
+                    })
+            else:
+                entries.append({
+                    "type":     "tool",
+                    "source":   "project",
+                    "tool":     name,
+                    "version":  version,
+                    "python":   python,
+                    "tool_dir": str(d),
+                    "venv_dir": str(venv_dir),
+                    "name":     name,
+                    "path":     str(d),
+                    "is_root":  True,
+                })
+
+            # ne pas redescendre dans un projet déjà identifié
+            dirnames[:] = []
+
+    return entries
+
+
+def parse_uv_tools() -> list[dict]:
+    """Combine les outils installés globalement (`uv tool install`) et les
+    projets uv trouvés sous UV_PROJECT_DIRS (par défaut ~/Documents/Python)."""
+    return _parse_uv_tool_installs() + find_uv_projects(UV_PROJECT_DIRS)
+
+
 def tool_install_state(e: dict) -> str:
-    """'uv' si le point d'entrée est un symlink dans le venv de l'outil, sinon 'pip'."""
+    """'uv' si le point d'entrée est bien dans le venv du projet/outil, sinon 'pip'."""
+    if e.get("is_root"):
+        return "uv"
     try:
         resolved = Path(e["path"]).resolve()
-        base = Path(e["tool_dir"]).resolve()
+        base = Path(e["venv_dir"]).resolve()
         resolved.relative_to(base)
         return "uv"
     except (OSError, ValueError):
         return "pip"
 
 
-def tool_structure_summary(tool_dir: str, limit: int = 60) -> str:
-    """Résumé du contenu de site-packages pour l'outil installé dans tool_dir."""
-    lib = Path(tool_dir) / "lib"
+def tool_structure_summary(venv_dir: str, limit: int = 60) -> str:
+    """Résumé du contenu de site-packages du venv (outil uv ou projet)."""
+    lib = Path(venv_dir) / "lib"
     site_packages = None
     if lib.is_dir():
         for py_dir in sorted(lib.glob("python3.*")):
@@ -267,7 +386,7 @@ def tool_structure_summary(tool_dir: str, limit: int = 60) -> str:
                 site_packages = candidate
                 break
     if site_packages is None:
-        return "(structure introuvable)"
+        return "(venv non créé — uv sync requis)"
 
     names = sorted(p.name for p in site_packages.iterdir() if p.name not in _SITE_PKG_NOISE)
     pretty = [n + "/" if (site_packages / n).is_dir() else n for n in names]
@@ -429,7 +548,7 @@ class AliasMenu(App):
                 self._load_tools()
                 self._tools_loaded = True
             n = len(self.tools_entries)
-            self._status(f"{n} point(s) d'entrée  ·  uv tool list  ·  [t] liste/arbre  [s] détails")
+            self._status(f"{n} point(s) d'entrée  ·  uv tool install + {UV_PROJECT_DIRS[0]}  ·  [t] liste/arbre  [s] détails")
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -477,6 +596,11 @@ class AliasMenu(App):
         self.tools_entries = parse_uv_tools()
         self._render_tools_table()
 
+    _SOURCE_LABELS = {
+        "uv-tool": "Outils uv (uv tool install)",
+        "project": f"Projets uv ({', '.join(str(p) for p in UV_PROJECT_DIRS)})",
+    }
+
     def _render_tools_table(self) -> None:
         t = self.query_one("#tools-table", DataTable)
         t.clear(columns=True)
@@ -486,12 +610,19 @@ class AliasMenu(App):
         if self._tools_view_mode == "tree":
             info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Répertoire d'installation")
             t.add_columns("  ▶ Run  ", "  ? Man  ", "Arborescence d'installation", info1_h, info2_h)
+            current_source = None
             current_tool = None
             for e in self.tools_entries:
+                if e["source"] != current_source:
+                    current_source = e["source"]
+                    current_tool = None
+                    label = self._SOURCE_LABELS.get(current_source) or current_source or ""
+                    t.add_row(*_sec_row(label), key=f"tsh{len(self._tool_rows)}")
+                    self._tool_rows.append(None)
                 if e["tool"] != current_tool:
                     current_tool = e["tool"]
                     if detail:
-                        info1, info2 = tool_install_state(e), tool_structure_summary(e["tool_dir"])
+                        info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
                     else:
                         info1, info2 = e["python"], e["tool_dir"]
                     t.add_row(
@@ -502,28 +633,32 @@ class AliasMenu(App):
                         key=f"th{len(self._tool_rows)}",
                     )
                     self._tool_rows.append(None)
+                entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
                 t.add_row(
                     "[bold green] [SPC] [/bold green]",
                     "[bold cyan]  [H]  [/bold cyan]",
-                    f"   [yellow]├─ {e['name']}[/yellow]",
+                    f"   [yellow]├─ {entry_label}[/yellow]",
                     "",
                     f"[dim]{e['path']}[/dim]",
                     key=f"te{len(self._tool_rows)}",
                 )
                 self._tool_rows.append(e)
         else:
-            info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Chemin (~/.local/bin)")
-            t.add_columns("  ▶ Run  ", "  ? Man  ", "Outil", "Point d'entrée", info1_h, info2_h)
+            info1_h, info2_h = ("État", "Structure (site-packages)") if detail else ("Python", "Chemin")
+            t.add_columns("  ▶ Run  ", "  ? Man  ", "Source", "Outil", "Point d'entrée", info1_h, info2_h)
             for e in self.tools_entries:
                 if detail:
-                    info1, info2 = tool_install_state(e), tool_structure_summary(e["tool_dir"])
+                    info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
                 else:
                     info1, info2 = e["python"], e["path"]
+                source_cell = "[dim]uv tool[/dim]" if e["source"] == "uv-tool" else "[dim]projet[/dim]"
+                entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
                 t.add_row(
                     "[bold green] [SPC] [/bold green]",
                     "[bold cyan]  [H]  [/bold cyan]",
+                    source_cell,
                     f"[bold yellow]{e['tool']}[/bold yellow]",
-                    e["name"],
+                    entry_label,
                     f"[dim]{info1}[/dim]",
                     f"[dim]{info2}[/dim]",
                     key=f"t{len(self._tool_rows)}",
@@ -607,11 +742,12 @@ class AliasMenu(App):
                     input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
 
     def _run_tool(self, e: dict) -> None:
-        name = e["name"]
+        name = e["tool"] if e.get("is_root") else e["name"]
+        prefill = f"cd '{e['tool_dir']}' && " if e.get("is_root") else f"{e['name']} "
         self._status(f"{name} — tapez des arguments si besoin, puis Entrée")
         with self.suspend():
             print(f"\n\033[1;32m▶  {name}\033[0m  \033[2m({e['tool']} v{e['version']})\033[0m\n{'─'*60}")
-            readline.set_startup_hook(lambda: readline.insert_text(f"{name} "))
+            readline.set_startup_hook(lambda: readline.insert_text(prefill))
             try:
                 cmd = input("\033[1;33m$ \033[0m")
             except (EOFError, KeyboardInterrupt):
@@ -648,6 +784,20 @@ class AliasMenu(App):
                 )
                 body = entry["body"] or "(corps vide)"
                 subprocess.run(["less", "-R"], input=(header + body + "\n").encode())
+        elif entry.get("is_root"):
+            self._status(f"Résumé du projet : {entry['tool']}")
+            with self.suspend():
+                structure = tool_structure_summary(entry["venv_dir"], limit=1000)
+                state = tool_install_state(entry)
+                summary = (
+                    f"\033[1;36m# {entry['tool']}\033[0m  v{entry['version'] or '?'}\n"
+                    f"\033[2mRépertoire : {entry['tool_dir']}\033[0m\n"
+                    f"\033[2mPython venv : {entry['python'] or '(non créé)'}\033[0m\n"
+                    f"\033[2mÉtat : {state}\033[0m\n"
+                    f"{'─'*60}\n"
+                    f"Contenu de site-packages :\n{structure}\n"
+                )
+                subprocess.run(["less", "-R"], input=summary.encode())
         else:
             name = entry["name"]
             self._status(f"Manuel : {name}")
