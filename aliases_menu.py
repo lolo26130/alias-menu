@@ -8,6 +8,8 @@ Alias & Functions Browser — menu TUI style DietPi
 Lancement : uv run ~/scripts/aliases_menu.py   ou   am
 """
 
+import configparser
+import json
 import os
 import re
 import readline
@@ -364,16 +366,213 @@ def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
     return entries
 
 
+def _pip_project_health(d: Path) -> bool:
+    """Critère minimal de 'bonne santé' : un descripteur de build exploitable
+    (pyproject.toml avec [project]/[build-system], ou setup.py/setup.cfg)."""
+    pyproject = d / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            text = pyproject.read_text()
+        except OSError:
+            text = ""
+        if "[build-system]" in text or "[project]" in text:
+            return True
+    return (d / "setup.py").exists() or (d / "setup.cfg").exists()
+
+
+def _find_all_venvs(roots: list[Path], max_depth: int = 8) -> list[Path]:
+    """Liste tous les venvs (n'importe quel nom, détecté via pyvenv.cfg) sous
+    les arborescences données — un package éditable peut être installé dans
+    le venv d'un *autre* projet (dépendance locale partagée), pas seulement
+    dans son propre venv."""
+    venvs: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            d = Path(dirpath)
+            if "pyvenv.cfg" in filenames:
+                venvs.append(d)
+                dirnames[:] = []
+                continue
+            depth = len(d.relative_to(root).parts)
+            # Repère les sous-dossiers qui sont eux-mêmes des venvs (pyvenv.cfg)
+            # *avant* de filtrer via _PROJECT_SCAN_PRUNE (qui exclut ".venv"/"venv"
+            # du parcours) — sinon on ne les visiterait jamais.
+            kept = []
+            for n in dirnames:
+                if (d / n / "pyvenv.cfg").exists():
+                    venvs.append(d / n)
+                elif n not in _PROJECT_SCAN_PRUNE:
+                    kept.append(n)
+            dirnames[:] = kept
+            if depth >= max_depth:
+                dirnames[:] = []
+    return venvs
+
+
+def _site_packages_dir(venv_dir: Path) -> Path | None:
+    lib = venv_dir / "lib"
+    if not lib.is_dir():
+        return None
+    for py_dir in sorted(lib.glob("python3.*")):
+        cand = py_dir / "site-packages"
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def _editable_markers_in(site_packages: Path) -> list[dict]:
+    """Recense, dans site_packages, tous les marqueurs d'install --editable
+    (direct_url.json moderne ou .egg-link historique) et le répertoire cible
+    réel de chacun — c'est le signe qu'un package est *vraiment* installé,
+    pas juste un dossier qui ressemble à un projet."""
+    found: list[dict] = []
+
+    for dist_info in site_packages.glob("*.dist-info"):
+        direct_url = dist_info / "direct_url.json"
+        if not direct_url.exists():
+            continue
+        try:
+            data = json.loads(direct_url.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not data.get("dir_info", {}).get("editable"):
+            continue
+        url = data.get("url", "")
+        if not url.startswith("file://"):
+            continue
+        try:
+            target = Path(url[len("file://"):]).resolve()
+        except OSError:
+            continue
+        stem = dist_info.name[: -len(".dist-info")]
+        name, _, version = stem.rpartition("-") if "-" in stem else (stem, "", "")
+        found.append({"target": target, "name": name or stem, "version": version, "dist_info": dist_info})
+
+    for egg_link in site_packages.glob("*.egg-link"):
+        try:
+            first_line = egg_link.read_text().splitlines()[0].strip()
+        except (OSError, IndexError):
+            continue
+        if not first_line:
+            continue
+        try:
+            target = Path(first_line).resolve()
+        except OSError:
+            continue
+        found.append({"target": target, "name": egg_link.stem, "version": "", "dist_info": None})
+
+    return found
+
+
+def _entry_points_from_dist_info(dist_info: Path | None) -> dict:
+    if dist_info is None:
+        return {}
+    ep_file = dist_info / "entry_points.txt"
+    if not ep_file.exists():
+        return {}
+    cp = configparser.ConfigParser()
+    try:
+        cp.read_string(ep_file.read_text())
+    except (OSError, configparser.Error):
+        return {}
+    if not cp.has_section("console_scripts"):
+        return {}
+    return dict(cp.items("console_scripts"))
+
+
+def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str]) -> list[dict]:
+    """Cherche, dans tous les venvs trouvés sous les arborescences données,
+    des packages installés en mode `pip install -e .` qui pointent vers un
+    répertoire-projet réel de la même arborescence. Un éditable peut être
+    installé dans le venv d'un *autre* projet (dépendance locale partagée :
+    p.ex. une bibliothèque maison réutilisée par plusieurs scripts) — on ne
+    se limite donc pas au venv local du projet. Critères de bonne santé :
+    le répertoire cible existe, contient un descripteur de build exploitable
+    (pyproject.toml/setup.py/setup.cfg), n'est pas déjà classé comme projet
+    uv, et le marqueur d'édition est réellement résolu (pas un lien mort)."""
+    by_target: dict[str, dict] = {}
+
+    for venv_dir in _find_all_venvs(roots):
+        site_packages = _site_packages_dir(venv_dir)
+        if site_packages is None:
+            continue
+        for marker in _editable_markers_in(site_packages):
+            target = marker["target"]
+            if not target.is_dir() or str(target) in skip_dirs:
+                continue
+            if not any(target == r or r in target.parents for r in roots):
+                continue
+            if not _pip_project_health(target):
+                continue
+
+            key = str(target)
+            prev = by_target.get(key)
+            # Préfère le venv local du projet (si on en retrouve un), sinon le
+            # premier venv (tiers) où l'éditable a été repéré.
+            is_local = venv_dir.parent == target
+            if prev is None or (is_local and not prev["_local"]):
+                by_target[key] = {
+                    "target": target, "venv_dir": venv_dir,
+                    "name": marker["name"], "version": marker["version"],
+                    "dist_info": marker["dist_info"], "_local": is_local,
+                }
+
+    entries: list[dict] = []
+    for info in by_target.values():
+        d, venv_dir = info["target"], info["venv_dir"]
+        name, version = info["name"], info["version"]
+        python = _venv_python_version(venv_dir)
+        scripts = _entry_points_from_dist_info(info["dist_info"])
+
+        if scripts:
+            for script_name in scripts:
+                exe = venv_dir / "bin" / script_name
+                entries.append({
+                    "type":     "tool",
+                    "source":   "pip-editable",
+                    "tool":     name,
+                    "version":  version,
+                    "python":   python,
+                    "tool_dir": str(d),
+                    "venv_dir": str(venv_dir),
+                    "name":     script_name,
+                    "path":     str(exe) if exe.exists() else "(non installé)",
+                    "is_root":  False,
+                })
+        else:
+            entries.append({
+                "type":     "tool",
+                "source":   "pip-editable",
+                "tool":     name,
+                "version":  version,
+                "python":   python,
+                "tool_dir": str(d),
+                "venv_dir": str(venv_dir),
+                "name":     name,
+                "path":     str(d),
+                "is_root":  True,
+            })
+
+    return entries
+
+
 def parse_uv_tools() -> list[dict]:
-    """Combine les outils installés globalement (`uv tool install`) et les
-    projets uv trouvés sous UV_PROJECT_DIRS (par défaut ~/Documents/Python)."""
-    return _parse_uv_tool_installs() + find_uv_projects(UV_PROJECT_DIRS)
+    """Combine les outils installés globalement (`uv tool install`), les
+    projets uv trouvés sous UV_PROJECT_DIRS, et les projets pip --editable
+    (même arborescence, hors dossiers déjà classés comme uv)."""
+    uv_tool_entries = _parse_uv_tool_installs()
+    project_entries = find_uv_projects(UV_PROJECT_DIRS)
+    uv_project_dirs = {e["tool_dir"] for e in project_entries}
+    pip_entries = find_pip_editable_projects(UV_PROJECT_DIRS, uv_project_dirs)
+    return uv_tool_entries + project_entries + pip_entries
 
 
 def tool_install_state(e: dict) -> str:
     """'uv' si le point d'entrée est bien dans le venv du projet/outil, sinon 'pip'."""
     if e.get("is_root"):
-        return "uv"
+        return "pip" if e.get("source") == "pip-editable" else "uv"
     try:
         resolved = Path(e["path"]).resolve()
         base = Path(e["venv_dir"]).resolve()
@@ -676,9 +875,11 @@ class AliasMenu(App):
         self._render_tools_table()
 
     _SOURCE_LABELS = {
-        "uv-tool": "Outils uv (uv tool install)",
-        "project": f"Projets uv ({', '.join(str(p) for p in UV_PROJECT_DIRS)})",
+        "uv-tool":      "Outils uv (uv tool install)",
+        "project":      f"Projets uv ({', '.join(str(p) for p in UV_PROJECT_DIRS)})",
+        "pip-editable": f"Projets pip --editable ({', '.join(str(p) for p in UV_PROJECT_DIRS)})",
     }
+    _SOURCE_TAGS = {"uv-tool": "uv tool", "project": "projet uv", "pip-editable": "pip -e"}
 
     def _render_tools_table(self) -> None:
         t = self.query_one("#tools-table", DataTable)
@@ -707,7 +908,7 @@ class AliasMenu(App):
                 info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
             else:
                 info1, info2 = e["python"], e["path"]
-            source_cell = "[dim]uv tool[/dim]" if e["source"] == "uv-tool" else "[dim]projet[/dim]"
+            source_cell = f"[dim]{self._SOURCE_TAGS.get(e['source'], e['source'])}[/dim]"
             entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
             t.add_row(
                 "[bold green] [SPC] [/bold green]",
