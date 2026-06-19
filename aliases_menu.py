@@ -33,7 +33,28 @@ _PROJECT_SCAN_PRUNE = {
     ".venv", "venv", "__pycache__", ".git", "node_modules",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
     "build", "dist", ".tox", ".idea", ".ipynb_checkpoints", ".cache",
+    ".buildozer",
 }
+# Noms de dossiers indiquant un dépôt tiers téléchargé / un exemple / un
+# exercice de formation plutôt qu'un projet personnel — utilisé uniquement
+# pour filtrer les projets pip *non confirmés* (cf. find_pip_editable_projects) ;
+# un projet dont l'install --editable est réellement retrouvée reste listé
+# même si son chemin matche un de ces motifs.
+_THIRDPARTY_ANCESTOR_NAMES = {"old", "libraries", "exemple_python_repo", "tests_exemples", "doc_python", "examples"}
+
+
+def _looks_like_thirdparty(d: Path, roots: list[Path]) -> bool:
+    name_lower = d.name.lower()
+    if name_lower.endswith("master") or name_lower.endswith("-main") or name_lower == "main":
+        return True
+    for root in roots:
+        try:
+            parts = d.relative_to(root).parts
+        except ValueError:
+            continue
+        if any(p.lower() in _THIRDPARTY_ANCESTOR_NAMES for p in parts):
+            return True
+    return False
 
 # Séparateurs lourds (===) → titres de section ; légers (---) → ignorés
 _HEAVY_SEP_RE = re.compile(r"^=+$")
@@ -366,9 +387,21 @@ def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
     return entries
 
 
+def _is_real_setup_py(path: Path) -> bool:
+    """Un setup.py de packaging appelle réellement setup() via setuptools/distutils
+    — ça écarte les modules qui s'appellent juste 'setup.py' par coïncidence
+    (ex: un sous-module 'configuration initiale' sans aucun rapport au packaging)."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    return "setup(" in text and ("setuptools" in text or "distutils" in text)
+
+
 def _pip_project_health(d: Path) -> bool:
     """Critère minimal de 'bonne santé' : un descripteur de build exploitable
-    (pyproject.toml avec [project]/[build-system], ou setup.py/setup.cfg)."""
+    (pyproject.toml avec [project]/[build-system], setup.cfg avec [metadata],
+    ou un setup.py qui appelle vraiment setup())."""
     pyproject = d / "pyproject.toml"
     if pyproject.exists():
         try:
@@ -377,7 +410,19 @@ def _pip_project_health(d: Path) -> bool:
             text = ""
         if "[build-system]" in text or "[project]" in text:
             return True
-    return (d / "setup.py").exists() or (d / "setup.cfg").exists()
+
+    setup_cfg = d / "setup.cfg"
+    if setup_cfg.exists():
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(setup_cfg)
+            if cp.has_section("metadata"):
+                return True
+        except (OSError, configparser.Error):
+            pass
+
+    setup_py = d / "setup.py"
+    return setup_py.exists() and _is_real_setup_py(setup_py)
 
 
 def _find_all_venvs(roots: list[Path], max_depth: int = 8) -> list[Path]:
@@ -482,53 +527,179 @@ def _entry_points_from_dist_info(dist_info: Path | None) -> dict:
     return dict(cp.items("console_scripts"))
 
 
-def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str]) -> list[dict]:
-    """Cherche, dans tous les venvs trouvés sous les arborescences données,
-    des packages installés en mode `pip install -e .` qui pointent vers un
-    répertoire-projet réel de la même arborescence. Un éditable peut être
-    installé dans le venv d'un *autre* projet (dépendance locale partagée :
-    p.ex. une bibliothèque maison réutilisée par plusieurs scripts) — on ne
-    se limite donc pas au venv local du projet. Critères de bonne santé :
-    le répertoire cible existe, contient un descripteur de build exploitable
-    (pyproject.toml/setup.py/setup.cfg), n'est pas déjà classé comme projet
-    uv, et le marqueur d'édition est réellement résolu (pas un lien mort)."""
-    by_target: dict[str, dict] = {}
+def _setup_cfg_metadata(cfg_path: Path) -> tuple[str, str]:
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(cfg_path)
+    except (OSError, configparser.Error):
+        return "", ""
+    if not cp.has_section("metadata"):
+        return "", ""
+    return cp.get("metadata", "name", fallback=""), cp.get("metadata", "version", fallback="")
 
+
+def _setup_cfg_console_scripts(cfg_path: Path) -> dict:
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(cfg_path)
+    except (OSError, configparser.Error):
+        return {}
+    if not cp.has_section("options.entry_points"):
+        return {}
+    scripts: dict = {}
+    for line in cp.get("options.entry_points", "console_scripts", fallback="").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        scripts[key.strip()] = val.strip()
+    return scripts
+
+
+def _local_egg_info(d: Path) -> Path | None:
+    matches = sorted(d.glob("*.egg-info"))
+    return matches[0] if matches else None
+
+
+def _read_pkg_info_name_version(pkg_info: Path) -> tuple[str, str]:
+    name = version = ""
+    try:
+        for line in pkg_info.read_text(errors="replace").splitlines():
+            if line.startswith("Name:"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("Version:"):
+                version = line.split(":", 1)[1].strip()
+            if name and version:
+                break
+    except OSError:
+        pass
+    return name, version
+
+
+def _pip_project_identity(d: Path) -> tuple[str, str, dict]:
+    """Détermine (nom, version, points d'entrée déclarés) d'un projet pip
+    'classique' à partir des descripteurs disponibles, par ordre de
+    préférence : pyproject.toml [project], setup.cfg [metadata] /
+    [options.entry_points], puis egg-info/PKG-INFO si le projet a déjà été
+    construit/installé localement (`setup.py develop` / `pip install -e .`)."""
+    name = version = ""
+    scripts: dict = {}
+
+    pyproject = d / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            data = tomllib.loads(pyproject.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            data = {}
+        project = data.get("project", {})
+        name = project.get("name", "")
+        version = project.get("version", "")
+        scripts.update(project.get("scripts", {}) or {})
+        scripts.update(project.get("gui-scripts", {}) or {})
+
+    setup_cfg = d / "setup.cfg"
+    if setup_cfg.exists():
+        cfg_name, cfg_version = _setup_cfg_metadata(setup_cfg)
+        name = name or cfg_name
+        version = version or cfg_version
+        if not scripts:
+            scripts.update(_setup_cfg_console_scripts(setup_cfg))
+
+    egg_info = _local_egg_info(d)
+    if egg_info is not None:
+        pkg_info = egg_info / "PKG-INFO"
+        if pkg_info.exists():
+            egg_name, egg_version = _read_pkg_info_name_version(pkg_info)
+            name = name or egg_name
+            version = version or egg_version
+        if not scripts:
+            scripts.update(_entry_points_from_dist_info(egg_info))
+
+    return name or d.name, version, scripts
+
+
+def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str], max_depth: int = 6) -> list[dict]:
+    """Cherche, sous les mêmes arborescences que les projets uv, les projets
+    pip 'classiques' (setup.py/setup.cfg/pyproject.toml, sans gestion uv).
+    Quand un venv — le leur ou celui d'un *autre* projet (dépendance locale
+    partagée, p.ex. une bibliothèque maison réutilisée par plusieurs scripts)
+    — contient réellement leur marqueur --editable, on récupère les infos
+    précises (nom/version/points d'entrée) depuis cette install confirmée.
+    Sinon, le projet est quand même listé tant qu'il présente un critère de
+    bonne santé minimal : un descripteur de build exploitable et un nom
+    résoluble (pyproject.toml [project], setup.cfg [metadata], ou egg-info
+    s'il a déjà été construit) — c'est le signe qu'il est réellement
+    installable, même si l'install actuelle a été faite ailleurs ou plus."""
+    installed: dict[str, dict] = {}
     for venv_dir in _find_all_venvs(roots):
         site_packages = _site_packages_dir(venv_dir)
         if site_packages is None:
             continue
         for marker in _editable_markers_in(site_packages):
             target = marker["target"]
-            if not target.is_dir() or str(target) in skip_dirs:
+            if not target.is_dir():
                 continue
-            if not any(target == r or r in target.parents for r in roots):
-                continue
-            if not _pip_project_health(target):
-                continue
-
             key = str(target)
-            prev = by_target.get(key)
+            prev = installed.get(key)
             # Préfère le venv local du projet (si on en retrouve un), sinon le
             # premier venv (tiers) où l'éditable a été repéré.
             is_local = venv_dir.parent == target
             if prev is None or (is_local and not prev["_local"]):
-                by_target[key] = {
-                    "target": target, "venv_dir": venv_dir,
-                    "name": marker["name"], "version": marker["version"],
-                    "dist_info": marker["dist_info"], "_local": is_local,
+                installed[key] = {
+                    "venv_dir": venv_dir, "name": marker["name"],
+                    "version": marker["version"], "dist_info": marker["dist_info"],
+                    "_local": is_local,
                 }
 
     entries: list[dict] = []
-    for info in by_target.values():
-        d, venv_dir = info["target"], info["venv_dir"]
-        name, version = info["name"], info["version"]
-        python = _venv_python_version(venv_dir)
-        scripts = _entry_points_from_dist_info(info["dist_info"])
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, _filenames in os.walk(root):
+            d = Path(dirpath)
+            depth = len(d.relative_to(root).parts)
+            dirnames[:] = [
+                n for n in dirnames
+                if n not in _PROJECT_SCAN_PRUNE and not (d / n / "pyvenv.cfg").exists()
+            ]
+            if depth >= max_depth:
+                dirnames[:] = []
+            if str(d) in skip_dirs or not _pip_project_health(d):
+                continue
 
-        if scripts:
-            for script_name in scripts:
-                exe = venv_dir / "bin" / script_name
+            confirmed = installed.get(str(d))
+            if confirmed is None and _looks_like_thirdparty(d, roots):
+                continue
+            decl_name, decl_version, decl_scripts = _pip_project_identity(d)
+
+            if confirmed:
+                venv_dir = confirmed["venv_dir"]
+                name = confirmed["name"] or decl_name
+                version = confirmed["version"] or decl_version
+                scripts = decl_scripts or _entry_points_from_dist_info(confirmed["dist_info"])
+            else:
+                local_venv = d / ".venv"
+                venv_dir = local_venv if local_venv.exists() else None
+                name, version, scripts = decl_name, decl_version, decl_scripts
+
+            python = _venv_python_version(venv_dir) if venv_dir else ""
+
+            if scripts:
+                for script_name in scripts:
+                    exe = (venv_dir / "bin" / script_name) if venv_dir else None
+                    entries.append({
+                        "type":     "tool",
+                        "source":   "pip-editable",
+                        "tool":     name,
+                        "version":  version,
+                        "python":   python,
+                        "tool_dir": str(d),
+                        "venv_dir": str(venv_dir) if venv_dir else str(d),
+                        "name":     script_name,
+                        "path":     str(exe) if exe and exe.exists() else "(non installé — pip install -e . requis)",
+                        "is_root":  False,
+                    })
+            else:
                 entries.append({
                     "type":     "tool",
                     "source":   "pip-editable",
@@ -536,24 +707,13 @@ def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str]) -> list[d
                     "version":  version,
                     "python":   python,
                     "tool_dir": str(d),
-                    "venv_dir": str(venv_dir),
-                    "name":     script_name,
-                    "path":     str(exe) if exe.exists() else "(non installé)",
-                    "is_root":  False,
+                    "venv_dir": str(venv_dir) if venv_dir else str(d),
+                    "name":     name,
+                    "path":     str(d),
+                    "is_root":  True,
                 })
-        else:
-            entries.append({
-                "type":     "tool",
-                "source":   "pip-editable",
-                "tool":     name,
-                "version":  version,
-                "python":   python,
-                "tool_dir": str(d),
-                "venv_dir": str(venv_dir),
-                "name":     name,
-                "path":     str(d),
-                "is_root":  True,
-            })
+
+            dirnames[:] = []
 
     return entries
 
@@ -593,7 +753,7 @@ def tool_structure_summary(venv_dir: str, limit: int = 60) -> str:
                 site_packages = candidate
                 break
     if site_packages is None:
-        return "(venv non créé — uv sync requis)"
+        return "(pas de venv — install à faire)"
 
     names = sorted(p.name for p in site_packages.iterdir() if p.name not in _SITE_PKG_NOISE)
     pretty = [n + "/" if (site_packages / n).is_dir() else n for n in names]
