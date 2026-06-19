@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=0.40.0"]
+# dependencies = ["textual>=0.40.0", "plotext>=5.2.8"]
 # ///
 """
 Alias & Functions Browser — menu TUI style DietPi
 Lancement : uv run ~/scripts/aliases_menu.py   ou   am
 """
 
+import ast
 import configparser
 import json
 import os
+import random
 import re
 import readline
 import subprocess
 import tomllib
+import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -797,6 +801,485 @@ def render_dir_tree(root: Path, max_depth: int = 3, max_per_dir: int = 40) -> st
     return "\n".join(lines)
 
 
+# ─── README & schéma Mermaid ───────────────────────────────────────────────────
+
+_README_NAMES = ("README.md", "README.rst", "README.txt", "README")
+_DIAGRAM_PRUNE = _PROJECT_SCAN_PRUNE | {"tests", "test", "docs"}
+_DIAGRAM_MAX_NODES = 35
+
+
+def find_readme(d: Path) -> Path | None:
+    """Cherche un fichier README (insensible à la casse) à la racine du projet."""
+    if not d.is_dir():
+        return None
+    for name in _README_NAMES:
+        p = d / name
+        if p.exists():
+            return p
+    for child in d.iterdir():
+        if child.is_file() and child.name.lower() in {n.lower() for n in _README_NAMES}:
+            return child
+    return None
+
+
+def _find_package_root(tool_dir: Path, pkg_name: str) -> Path | None:
+    """Localise le dossier représentant le package Python (layout src/ ou plat)."""
+    safe = pkg_name.replace("-", "_")
+    for cand in (tool_dir / "src" / safe, tool_dir / safe):
+        if cand.is_dir() and any(cand.glob("*.py")):
+            return cand
+    if any(tool_dir.glob("*.py")):
+        return tool_dir
+    for child in sorted(tool_dir.iterdir()) if tool_dir.is_dir() else []:
+        if child.is_dir() and (child / "__init__.py").exists():
+            return child
+    return None
+
+
+def _iter_py_files(src_root: Path) -> list[Path]:
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(src_root):
+        d = Path(dirpath)
+        dirnames[:] = [n for n in dirnames if n not in _DIAGRAM_PRUNE and not (d / n / "pyvenv.cfg").exists()]
+        files.extend(d / f for f in filenames if f.endswith(".py"))
+    return files
+
+
+def _module_parts(path: Path, src_root: Path) -> tuple[str, ...]:
+    """Chemin du module relatif à src_root, sous forme de tuple ('sous', 'module')."""
+    parts = path.relative_to(src_root).with_suffix("").parts
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return parts
+
+
+def _collapse_node(parts: tuple[str, ...], pkg_root_name: str, depth: int = 2) -> str:
+    """Résume un module à 'package' ou 'package.sous_module' (profondeur bridée)
+    pour garder un schéma lisible plutôt qu'un graphe fichier par fichier."""
+    full = (pkg_root_name,) + parts
+    return ".".join(full[:depth])
+
+
+def _local_imports(path: Path, src_root: Path, pkg_root_name: str) -> list[tuple[str, ...]]:
+    """Modules internes au package importés par ce fichier (imports absolus
+    préfixés par pkg_root_name, et imports relatifs résolus)."""
+    try:
+        tree = ast.parse(path.read_text(errors="replace"))
+    except (OSError, SyntaxError):
+        return []
+
+    current_pkg = _module_parts(path, src_root)[:-1]
+    results: list[tuple[str, ...]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                dotted = alias.name.split(".")
+                if dotted[0] == pkg_root_name:
+                    results.append(tuple(dotted[1:]))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                up = node.level - 1
+                base = current_pkg[:-up] if up and up <= len(current_pkg) else current_pkg
+                mod_parts = list(base)
+                if node.module:
+                    mod_parts += node.module.split(".")
+                results.append(tuple(mod_parts))
+            elif node.module:
+                dotted = node.module.split(".")
+                if dotted[0] == pkg_root_name:
+                    results.append(tuple(dotted[1:]))
+
+    return results
+
+
+def _diagram_graph(py_files: list[Path], src_root: Path, pkg_root_name: str) -> tuple[set[str], set[tuple[str, str]], int]:
+    """Calcule le graphe (nœuds, arêtes, nb omis) des dépendances internes du
+    package : modules collapsés à 2 niveaux, et bridé à un nombre de nœuds
+    raisonnable (les plus connectés, en priorité) pour rester lisible."""
+    nodes: set[str] = set()
+    edges: set[tuple[str, str]] = set()
+
+    for f in py_files:
+        cur = _collapse_node(_module_parts(f, src_root), pkg_root_name)
+        nodes.add(cur)
+        for imp_parts in _local_imports(f, src_root, pkg_root_name):
+            imp = _collapse_node(imp_parts, pkg_root_name)
+            nodes.add(imp)
+            if imp != cur:
+                edges.add((cur, imp))
+
+    omitted = 0
+    if len(nodes) > _DIAGRAM_MAX_NODES:
+        degree: dict[str, int] = {}
+        for a, b in edges:
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+        keep = {n for n, _ in sorted(degree.items(), key=lambda kv: -kv[1])[:_DIAGRAM_MAX_NODES]}
+        keep.add(pkg_root_name)
+        omitted = len(nodes) - len(keep)
+        nodes = keep
+        edges = {(a, b) for a, b in edges if a in keep and b in keep}
+
+    return nodes, edges, omitted
+
+
+def _mermaid_safe_id(n: str) -> str:
+    return "n_" + re.sub(r"[^0-9A-Za-z_]", "_", n)
+
+
+def _build_mermaid(py_files: list[Path], src_root: Path, pkg_root_name: str) -> str:
+    """Construit un flowchart Mermaid résumé des dépendances internes du package."""
+    nodes, edges, omitted = _diagram_graph(py_files, src_root, pkg_root_name)
+
+    lines = ["flowchart TD"]
+    for n in sorted(nodes):
+        lines.append(f'    {_mermaid_safe_id(n)}["{n}"]')
+    for a, b in sorted(edges):
+        lines.append(f"    {_mermaid_safe_id(a)} --> {_mermaid_safe_id(b)}")
+    if omitted > 0:
+        lines.append(f'    note_more["… {omitted} module(s) supplémentaire(s) non affiché(s)"]')
+
+    return "\n".join(lines)
+
+
+def architecture_diagram(tool_dir: Path, pkg_name: str) -> str:
+    """Construit (ou réutilise depuis le cache ARCHITECTURE.md à côté du
+    README) un schéma Mermaid résumé de la structure interne du package —
+    régénéré seulement si le code source est plus récent que le cache."""
+    cache_file = tool_dir / "ARCHITECTURE.md"
+    src_root = _find_package_root(tool_dir, pkg_name)
+    if src_root is None:
+        return "(aucun code source Python trouvé pour générer un schéma)"
+
+    py_files = _iter_py_files(src_root)
+    if not py_files:
+        return "(aucun fichier .py trouvé pour générer un schéma)"
+
+    newest = max((p.stat().st_mtime for p in py_files), default=0)
+    if cache_file.exists() and cache_file.stat().st_mtime >= newest:
+        try:
+            return cache_file.read_text()
+        except OSError:
+            pass
+
+    mermaid = _build_mermaid(py_files, src_root, src_root.name)
+    content = (
+        f"# Architecture — {pkg_name}\n\n"
+        f"_Généré automatiquement depuis le code source ({datetime.now():%Y-%m-%d}) — "
+        f"repasse par la touche **m** pour régénérer après modification._\n\n"
+        f"```mermaid\n{mermaid}\n```\n"
+    )
+    try:
+        cache_file.write_text(content)
+    except OSError:
+        pass
+    return content
+
+
+# ─── Rendu graphique (terminal & HTML) ─────────────────────────────────────────
+
+def _force_layout(nodes: list[str], edges: list[tuple[str, str]], iterations: int = 200) -> dict[str, tuple[float, float]]:
+    """Disposition 'élastique' façon force-directed (à la d3-force / spring
+    layout), implémentation classique de Fruchterman-Reingold en pur Python
+    (pas de dépendance networkx/scipy) : tous les nœuds se repoussent, les
+    nœuds reliés s'attirent, et le déplacement par itération est bridé par
+    une 'température' qui refroidit progressivement — ça garantit une
+    disposition stable même avec des nœuds très connectés (sans quoi les
+    forces peuvent s'accumuler et diverger vers l'infini)."""
+    if not nodes:
+        return {}
+    rng = random.Random(42)
+    n = len(nodes)
+    side = max(n, 1) ** 0.5 * 2.0
+    pos = {node: (rng.uniform(-side / 2, side / 2), rng.uniform(-side / 2, side / 2)) for node in nodes}
+    if n == 1:
+        return pos
+
+    k = side / (n ** 0.5)          # distance "idéale" entre nœuds reliés
+    t = side / 10                  # température initiale (déplacement max / itération)
+    dt = t / (iterations + 1)      # refroidissement linéaire jusqu'à ~0
+
+    for _ in range(iterations):
+        disp = {node: [0.0, 0.0] for node in nodes}
+
+        for i, a in enumerate(nodes):
+            ax, ay = pos[a]
+            for b in nodes[i + 1:]:
+                bx, by = pos[b]
+                dx, dy = ax - bx, ay - by
+                dist = max((dx * dx + dy * dy) ** 0.5, 0.01)
+                force = (k * k) / dist
+                fx, fy = dx / dist * force, dy / dist * force
+                disp[a][0] += fx
+                disp[a][1] += fy
+                disp[b][0] -= fx
+                disp[b][1] -= fy
+
+        for a, b in edges:
+            if a not in pos or b not in pos:
+                continue
+            ax, ay = pos[a]
+            bx, by = pos[b]
+            dx, dy = ax - bx, ay - by
+            dist = max((dx * dx + dy * dy) ** 0.5, 0.01)
+            force = (dist * dist) / k
+            fx, fy = dx / dist * force, dy / dist * force
+            disp[a][0] -= fx
+            disp[a][1] -= fy
+            disp[b][0] += fx
+            disp[b][1] += fy
+
+        # gravité vers le centre : sans elle, une composante peu connectée
+        # (ex. deux nœuds isolés du reste) peut être repoussée à l'infini
+        # par les autres nœuds sans jamais être rappelée vers eux.
+        gravity = 0.08
+        for node in nodes:
+            ax, ay = pos[node]
+            disp[node][0] -= ax * gravity
+            disp[node][1] -= ay * gravity
+
+        for node in nodes:
+            dx, dy = disp[node]
+            dlen = max((dx * dx + dy * dy) ** 0.5, 1e-9)
+            limited = min(dlen, t)
+            ax, ay = pos[node]
+            pos[node] = (ax + dx / dlen * limited, ay + dy / dlen * limited)
+
+        t -= dt
+
+    return pos
+
+
+def _render_graph_terminal(nodes: set[str] | list[str], edges: set[tuple[str, str]] | list[tuple[str, str]],
+                            title: str, omitted: int = 0, labels: dict[str, str] | None = None) -> str:
+    """Affiche le graphe dans le terminal en ASCII/braille via plotext, avec
+    une disposition 'élastique' calculée par _force_layout. Retourne un
+    message d'erreur si plotext est indisponible (hors `uv run`)."""
+    nodes = list(nodes)
+    edges = list(edges)
+    if not nodes:
+        return "(graphe vide — aucune dépendance détectée)"
+    labels = labels or {}
+
+    try:
+        import plotext as plt
+    except ImportError:
+        return "(plotext indisponible — relance via `uv run` pour l'avoir automatiquement)"
+
+    pos = _force_layout(nodes, edges)
+    cols, rows = 100, 32
+    try:
+        import shutil
+        term = shutil.get_terminal_size()
+        cols, rows = max(60, term.columns - 4), max(20, term.lines - 8)
+    except OSError:
+        pass
+
+    # Au-delà d'une vingtaine de nœuds, étiqueter tout le monde rend le
+    # rendu illisible (textes qui se superposent) — on ne nomme alors que
+    # les nœuds les plus connectés, les autres restent des points nus.
+    label_targets = set(nodes)
+    if len(nodes) > 20:
+        lbl_degree: dict[str, int] = {}
+        for a, b in edges:
+            lbl_degree[a] = lbl_degree.get(a, 0) + 1
+            lbl_degree[b] = lbl_degree.get(b, 0) + 1
+        label_targets = {n for n, _ in sorted(lbl_degree.items(), key=lambda kv: -kv[1])[:20]}
+
+    plt.clear_figure()
+    plt.plotsize(cols, rows)
+    plt.theme("clear")
+    for a, b in edges:
+        if a not in pos or b not in pos:
+            continue
+        xa, ya = pos[a]
+        xb, yb = pos[b]
+        plt.plot([xa, xb], [ya, yb], color="gray+")
+    xs = [pos[n][0] for n in nodes]
+    ys = [pos[n][1] for n in nodes]
+    plt.scatter(xs, ys, color="cyan", marker="hd")
+    for n in nodes:
+        if n not in label_targets:
+            continue
+        x, y = pos[n]
+        plt.text(labels.get(n, n), x=x, y=y, color="white", background="black")
+    plt.title(title + (f"  ({omitted} non affiché(s))" if omitted else ""))
+    plt.show()
+    return ""
+
+
+def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, str]] | list[tuple[str, str, str]],
+                        title: str, out_path: Path, labels: dict[str, str] | None = None) -> Path:
+    """Génère une page HTML autonome (vis-network via CDN) avec une mise en
+    page physique réellement élastique/interactive (zoom, glisser-déposer) —
+    le rendu 'comme en analyse web' demandé, ouvert dans le navigateur."""
+    labels = labels or {}
+    vis_nodes = [{"id": n, "label": labels.get(n, n)} for n in nodes]
+    vis_edges = [
+        {"from": a, "to": b, "color": {"color": "#e67e22" if kind == "declared" else "#3498db"},
+         "arrows": "to", "title": kind}
+        for a, b, kind in edges
+    ]
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body {{ margin: 0; height: 100%; background: #1e1e1e; font-family: sans-serif; }}
+  #title {{ color: #eee; padding: 8px 14px; font-size: 16px; }}
+  #graph {{ width: 100%; height: calc(100% - 40px); }}
+</style>
+</head>
+<body>
+<div id="title">{title} — bleu : import détecté, orange : dépendance déclarée</div>
+<div id="graph"></div>
+<script>
+  const nodes = new vis.DataSet({json.dumps(vis_nodes)});
+  const edges = new vis.DataSet({json.dumps(vis_edges)});
+  const container = document.getElementById('graph');
+  const data = {{ nodes, edges }};
+  const options = {{
+    nodes: {{ shape: 'dot', size: 12, font: {{ color: '#eee' }}, color: {{ background: '#2ecc71', border: '#27ae60' }} }},
+    edges: {{ smooth: {{ type: 'dynamic' }} }},
+    physics: {{ solver: 'forceAtlas2Based', forceAtlas2Based: {{ gravitationalConstant: -60, springLength: 120 }}, stabilization: {{ iterations: 200 }} }},
+    interaction: {{ hover: true, tooltipDelay: 100 }}
+  }};
+  new vis.Network(container, data, options);
+</script>
+</body>
+</html>
+"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html)
+    return out_path
+
+
+# ─── Graphe global des dépendances entre packages ──────────────────────────────
+
+def _norm_pkg_name(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
+
+
+def _declared_dependency_names(tool_dir: Path) -> set[str]:
+    """Noms de dépendances déclarées (pyproject.toml [project.dependencies] /
+    [tool.uv.sources], ou setup.cfg [options] install_requires), normalisés."""
+    names: set[str] = set()
+
+    pyproject = tool_dir / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            data = tomllib.loads(pyproject.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            data = {}
+        deps = (data.get("project", {}) or {}).get("dependencies", []) or []
+        for dep in deps:
+            m = re.match(r"[A-Za-z0-9_.\-]+", dep)
+            if m:
+                names.add(_norm_pkg_name(m.group(0)))
+        uv_sources = ((data.get("tool", {}) or {}).get("uv", {}) or {}).get("sources", {}) or {}
+        names.update(_norm_pkg_name(k) for k in uv_sources)
+
+    setup_cfg = tool_dir / "setup.cfg"
+    if setup_cfg.exists():
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(setup_cfg)
+            raw = cp.get("options", "install_requires", fallback="")
+            for line in raw.splitlines():
+                m = re.match(r"\s*([A-Za-z0-9_.\-]+)", line)
+                if m:
+                    names.add(_norm_pkg_name(m.group(1)))
+        except (OSError, configparser.Error):
+            pass
+
+    return names
+
+
+def _external_top_imports(tool_dir: Path) -> set[str]:
+    """Premiers segments de tous les imports (hors stdlib filtré implicitement
+    par l'absence de correspondance) trouvés dans les .py du projet, normalisés."""
+    names: set[str] = set()
+    for f in _iter_py_files(tool_dir):
+        try:
+            tree = ast.parse(f.read_text(errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(_norm_pkg_name(alias.name.split(".")[0]))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(_norm_pkg_name(node.module.split(".")[0]))
+    return names
+
+
+_DEP_GRAPH_MAX_NODES = 60
+
+
+def build_dependency_graph(entries: list[dict]) -> tuple[set[str], set[tuple[str, str, str]], dict[str, str], int]:
+    """Construit le graphe des dépendances entre TOUS les packages trouvés
+    (uv-tool / projets uv / pip --editable), à partir de deux signaux :
+    - imports détectés dans le code source référençant le nom (module ou
+      distribution) d'un autre package du catalogue ;
+    - dépendances déclarées (pyproject.toml / setup.cfg) qui correspondent au
+      nom d'un autre package du catalogue.
+    Retourne (nœuds, arêtes(src,dst,kind), labels{id: nom affiché}, nb omis)."""
+    packages: dict[str, dict] = {}
+    for e in entries:
+        tool_dir = e["tool_dir"]
+        if tool_dir in packages:
+            continue
+        packages[tool_dir] = {"label": e["tool"], "source": e["source"]}
+
+    # un même nom (python import vs nom de distribution) peut désigner le même package
+    norm_to_id: dict[str, str] = {}
+    for tool_dir, info in packages.items():
+        d = Path(tool_dir)
+        pkg_root = _find_package_root(d, info["label"])
+        candidates = {_norm_pkg_name(info["label"])}
+        if pkg_root is not None:
+            candidates.add(_norm_pkg_name(pkg_root.name))
+        for c in candidates:
+            norm_to_id.setdefault(c, tool_dir)
+
+    edges: set[tuple[str, str, str]] = set()
+
+    for tool_dir, info in packages.items():
+        d = Path(tool_dir)
+        for imp in _external_top_imports(d):
+            target = norm_to_id.get(imp)
+            if target and target != tool_dir:
+                edges.add((tool_dir, target, "import"))
+        for dep in _declared_dependency_names(d):
+            target = norm_to_id.get(dep)
+            if target and target != tool_dir:
+                edges.add((tool_dir, target, "declared"))
+
+    # Un graphe de *dépendances* n'a d'intérêt que pour les packages reliés à
+    # au moins un autre — les packages isolés (aucune dépendance détectée)
+    # sont donc exclus par défaut plutôt que dispersés sans connexion.
+    degree: dict[str, int] = {}
+    for a, b, _ in edges:
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+    nodes: set[str] = set(degree)
+    total_isolated = len(packages) - len(nodes)
+
+    omitted = total_isolated
+    if len(nodes) > _DEP_GRAPH_MAX_NODES:
+        connected = sorted(degree.items(), key=lambda kv: -kv[1])
+        keep = {n for n, _ in connected[:_DEP_GRAPH_MAX_NODES]}
+        omitted += len(nodes) - len(keep)
+        nodes = keep
+        edges = {(a, b, k) for a, b, k in edges if a in keep and b in keep}
+
+    labels = {tool_dir: packages[tool_dir]["label"] for tool_dir in nodes}
+    return nodes, edges, labels, omitted
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def man_target(cmd: str) -> str:
@@ -912,6 +1395,10 @@ class AliasMenu(App):
         Binding("r",          "reload",     "Recharger",    show=True),
         Binding("t",          "toggle_view",   "Arbre du dossier",   show=True),
         Binding("s",          "toggle_detail", "État/Structure", show=True),
+        Binding("d",          "show_doc",      "Doc (README)", show=True),
+        Binding("m",          "show_mermaid",  "Schéma package", show=True),
+        Binding("g",          "show_dep_graph_terminal", "Graphe deps (term.)", show=True),
+        Binding("G",          "show_dep_graph_html",     "Graphe deps (HTML)", show=True),
         # Changement d'onglet — priority=True pour passer avant le DataTable
         Binding("ctrl+right", "next_tab",   "Onglet →",     show=True,  priority=True),
         Binding("ctrl+left",  "prev_tab",   "← Onglet",     show=True,  priority=True),
@@ -986,7 +1473,7 @@ class AliasMenu(App):
                 self._load_tools()
                 self._tools_loaded = True
             n = len(self.tools_entries)
-            self._status(f"{n} point(s) d'entrée  ·  uv tool install + {UV_PROJECT_DIRS[0]}  ·  [t] arbre du dossier  [s] détails")
+            self._status(f"{n} point(s) d'entrée  ·  [t] arbre  [s] détails  [d] README  [m] schéma  [g] deps(term.)  [G] deps(HTML)")
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -1240,6 +1727,81 @@ class AliasMenu(App):
         self._tools_detail = not self._tools_detail
         self._render_tools_table()
         self._status("Détails : " + ("état + structure" if self._tools_detail else "python + chemin"))
+
+    def action_show_doc(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne un outil/projet pour afficher son README")
+            return
+        target_dir = Path(entry["tool_dir"])
+        readme = find_readme(target_dir)
+        self._status(f"README : {entry['tool']}")
+        with self.suspend():
+            if readme is None:
+                print(f"\n\033[33mAucun README trouvé dans {target_dir}\033[0m")
+                input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+                return
+            header = f"\033[1;36m# {entry['tool']}\033[0m  \033[2m({readme.name})\033[0m\n{'─'*60}\n"
+            try:
+                body = readme.read_text(errors="replace")
+            except OSError:
+                body = "(impossible de lire le fichier)"
+            subprocess.run(["less", "-R"], input=(header + body + "\n").encode())
+
+    def action_show_mermaid(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne un outil/projet pour générer son schéma")
+            return
+        target_dir = Path(entry["tool_dir"])
+        # Tient à jour le cache ARCHITECTURE.md (texte Mermaid, pour GitHub/lecture
+        # ultérieure) tout en affichant un rendu graphique directement dans le terminal.
+        architecture_diagram(target_dir, entry["tool"])
+        src_root = _find_package_root(target_dir, entry["tool"])
+        self._status(f"Schéma : {entry['tool']}  ·  cache : {target_dir / 'ARCHITECTURE.md'}")
+        with self.suspend():
+            if src_root is None:
+                print("\n\033[33mAucun code source Python trouvé pour générer un schéma\033[0m")
+            else:
+                py_files = _iter_py_files(src_root)
+                nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
+                print(f"\n\033[1;36m# Schéma — {entry['tool']}\033[0m\n{'─'*60}")
+                err = _render_graph_terminal(nodes, edges, entry["tool"], omitted)
+                if err:
+                    print(f"\033[33m{err}\033[0m")
+            input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+
+    def action_show_dep_graph_terminal(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        self._status("Analyse des dépendances entre packages…")
+        with self.suspend():
+            nodes, edges, labels, omitted = build_dependency_graph(self.tools_entries)
+            print(f"\n\033[1;36m# Graphe des dépendances entre packages\033[0m\n{'─'*60}")
+            err = _render_graph_terminal(nodes, {(a, b) for a, b, _ in edges},
+                                          "Dépendances entre packages", omitted, labels)
+            if err:
+                print(f"\033[33m{err}\033[0m")
+            input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+        self._status(f"{len(nodes)} package(s), {len(edges)} dépendance(s) détectée(s)")
+
+    def action_show_dep_graph_html(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        self._status("Analyse des dépendances entre packages…")
+        nodes, edges, labels, omitted = build_dependency_graph(self.tools_entries)
+        if not nodes:
+            self._status("Aucune dépendance détectée entre les packages")
+            return
+        out_path = Path.home() / ".cache" / "aliases_menu" / "dep_graph.html"
+        title = f"Dépendances entre packages ({len(nodes)} packages, {omitted} non affiché(s))"
+        _render_graph_html(nodes, edges, title, out_path, labels)
+        webbrowser.open(f"file://{out_path}")
+        self._status(f"Graphe HTML ouvert dans le navigateur · {out_path}")
 
     # ── action : reload ─────────────────────────────────────────────────────
 
