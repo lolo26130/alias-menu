@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=0.40.0", "plotext>=5.2.8"]
+# dependencies = ["textual>=0.40.0"]
 # ///
 """
 Alias & Functions Browser — menu TUI style DietPi
@@ -13,7 +13,6 @@ import configparser
 import hashlib
 import json
 import os
-import random
 import re
 import readline
 import subprocess
@@ -980,134 +979,47 @@ def architecture_diagram(tool_dir: Path, pkg_name: str) -> str:
 
 # ─── Rendu graphique (terminal & HTML) ─────────────────────────────────────────
 
-def _force_layout(nodes: list[str], edges: list[tuple[str, str]], iterations: int = 200) -> dict[str, tuple[float, float]]:
-    """Disposition 'élastique' façon force-directed (à la d3-force / spring
-    layout), implémentation classique de Fruchterman-Reingold en pur Python
-    (pas de dépendance networkx/scipy) : tous les nœuds se repoussent, les
-    nœuds reliés s'attirent, et le déplacement par itération est bridé par
-    une 'température' qui refroidit progressivement — ça garantit une
-    disposition stable même avec des nœuds très connectés (sans quoi les
-    forces peuvent s'accumuler et diverger vers l'infini)."""
+def _format_module_structure(nodes: set[str], edges: set[tuple[str, str]], omitted: int) -> str:
+    """Représentation textuelle (liste d'adjacence indentée, façon `pipdeptree`)
+    de la structure interne d'un package — bien plus lisible dans un terminal
+    qu'un dessin ASCII/braille où les étiquettes finissent par se chevaucher."""
     if not nodes:
-        return {}
-    rng = random.Random(42)
-    n = len(nodes)
-    side = max(n, 1) ** 0.5 * 2.0
-    pos = {node: (rng.uniform(-side / 2, side / 2), rng.uniform(-side / 2, side / 2)) for node in nodes}
-    if n == 1:
-        return pos
-
-    k = side / (n ** 0.5)          # distance "idéale" entre nœuds reliés
-    t = side / 10                  # température initiale (déplacement max / itération)
-    dt = t / (iterations + 1)      # refroidissement linéaire jusqu'à ~0
-
-    for _ in range(iterations):
-        disp = {node: [0.0, 0.0] for node in nodes}
-
-        for i, a in enumerate(nodes):
-            ax, ay = pos[a]
-            for b in nodes[i + 1:]:
-                bx, by = pos[b]
-                dx, dy = ax - bx, ay - by
-                dist = max((dx * dx + dy * dy) ** 0.5, 0.01)
-                force = (k * k) / dist
-                fx, fy = dx / dist * force, dy / dist * force
-                disp[a][0] += fx
-                disp[a][1] += fy
-                disp[b][0] -= fx
-                disp[b][1] -= fy
-
-        for a, b in edges:
-            if a not in pos or b not in pos:
-                continue
-            ax, ay = pos[a]
-            bx, by = pos[b]
-            dx, dy = ax - bx, ay - by
-            dist = max((dx * dx + dy * dy) ** 0.5, 0.01)
-            force = (dist * dist) / k
-            fx, fy = dx / dist * force, dy / dist * force
-            disp[a][0] -= fx
-            disp[a][1] -= fy
-            disp[b][0] += fx
-            disp[b][1] += fy
-
-        # gravité vers le centre : sans elle, une composante peu connectée
-        # (ex. deux nœuds isolés du reste) peut être repoussée à l'infini
-        # par les autres nœuds sans jamais être rappelée vers eux.
-        gravity = 0.08
-        for node in nodes:
-            ax, ay = pos[node]
-            disp[node][0] -= ax * gravity
-            disp[node][1] -= ay * gravity
-
-        for node in nodes:
-            dx, dy = disp[node]
-            dlen = max((dx * dx + dy * dy) ** 0.5, 1e-9)
-            limited = min(dlen, t)
-            ax, ay = pos[node]
-            pos[node] = (ax + dx / dlen * limited, ay + dy / dlen * limited)
-
-        t -= dt
-
-    return pos
-
-
-def _render_graph_terminal(nodes: set[str] | list[str], edges: set[tuple[str, str]] | list[tuple[str, str]],
-                            title: str, omitted: int = 0, labels: dict[str, str] | None = None) -> str:
-    """Affiche le graphe dans le terminal en ASCII/braille via plotext, avec
-    une disposition 'élastique' calculée par _force_layout. Retourne un
-    message d'erreur si plotext est indisponible (hors `uv run`)."""
-    nodes = list(nodes)
-    edges = list(edges)
-    if not nodes:
-        return "(graphe vide — aucune dépendance détectée)"
-    labels = labels or {}
-
-    try:
-        import plotext as plt
-    except ImportError:
-        return "(plotext indisponible — relance via `uv run` pour l'avoir automatiquement)"
-
-    pos = _force_layout(nodes, edges)
-    cols, rows = 100, 32
-    try:
-        import shutil
-        term = shutil.get_terminal_size()
-        cols, rows = max(60, term.columns - 4), max(20, term.lines - 8)
-    except OSError:
-        pass
-
-    # Au-delà d'une vingtaine de nœuds, étiqueter tout le monde rend le
-    # rendu illisible (textes qui se superposent) — on ne nomme alors que
-    # les nœuds les plus connectés, les autres restent des points nus.
-    label_targets = set(nodes)
-    if len(nodes) > 20:
-        lbl_degree: dict[str, int] = {}
-        for a, b in edges:
-            lbl_degree[a] = lbl_degree.get(a, 0) + 1
-            lbl_degree[b] = lbl_degree.get(b, 0) + 1
-        label_targets = {n for n, _ in sorted(lbl_degree.items(), key=lambda kv: -kv[1])[:20]}
-
-    plt.clear_figure()
-    plt.plotsize(cols, rows)
-    plt.theme("clear")
+        return "(aucun module trouvé)"
+    by_node: dict[str, list[str]] = {n: [] for n in nodes}
     for a, b in edges:
-        if a not in pos or b not in pos:
-            continue
-        xa, ya = pos[a]
-        xb, yb = pos[b]
-        plt.plot([xa, xb], [ya, yb], color="gray+")
-    xs = [pos[n][0] for n in nodes]
-    ys = [pos[n][1] for n in nodes]
-    plt.scatter(xs, ys, color="cyan", marker="hd")
-    for n in nodes:
-        if n not in label_targets:
-            continue
-        x, y = pos[n]
-        plt.text(labels.get(n, n), x=x, y=y, color="white", background="black")
-    plt.title(title + (f"  ({omitted} non affiché(s))" if omitted else ""))
-    plt.show()
-    return ""
+        by_node.setdefault(a, []).append(b)
+
+    lines: list[str] = []
+    for n in sorted(nodes):
+        lines.append(n)
+        for target in sorted(set(by_node.get(n, []))):
+            lines.append(f"  └─ {target}")
+    if omitted:
+        lines.append(f"\n… {omitted} module(s) supplémentaire(s) non affiché(s) (les plus connectés sont prioritaires)")
+    return "\n".join(lines)
+
+
+def _format_dependency_text(nodes: set[str], edges: set[tuple[str, str, str]],
+                             labels: dict[str, str], omitted: int) -> str:
+    """Représentation textuelle (liste d'adjacence indentée) des dépendances
+    entre packages — chaque package, suivi de ce dont il dépend, avec le
+    signal détecté (import réel vs dépendance déclarée)."""
+    if not nodes:
+        return "(aucune dépendance détectée entre les packages)"
+    by_node: dict[str, list[tuple[str, str]]] = {n: [] for n in nodes}
+    for a, b, kind in edges:
+        by_node.setdefault(a, []).append((b, kind))
+
+    lines: list[str] = []
+    for n in sorted(nodes, key=lambda x: labels.get(x, x).lower()):
+        lines.append(labels.get(n, n))
+        targets = sorted(set(by_node.get(n, [])), key=lambda tk: labels.get(tk[0], tk[0]).lower())
+        for target, kind in targets:
+            tag = "déclarée" if kind == "declared" else "import"
+            lines.append(f"  → {labels.get(target, target)}  ({tag})")
+    if omitted:
+        lines.append(f"\n… {omitted} package(s) non affiché(s) (isolés ou moins connectés)")
+    return "\n".join(lines)
 
 
 def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, str]] | list[tuple[str, str, str]],
@@ -1389,6 +1301,78 @@ class ReadmeOverlay(ModalScreen):
         self.dismiss()
 
 
+class SchemaOverlay(ModalScreen):
+    """Affiche la structure interne d'un package par-dessus la liste."""
+
+    BINDINGS = [
+        Binding("m",      "dismiss_overlay", "Fermer", show=True),
+        Binding("escape", "dismiss_overlay", "Fermer", show=True),
+        Binding("q",      "dismiss_overlay", "Fermer", show=False),
+    ]
+
+    CSS = """
+    SchemaOverlay { align: center middle; }
+    #schema-panel {
+        width: 92%;
+        height: 85%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #schema-title { text-style: bold; color: $accent; padding-bottom: 1; }
+    """
+
+    def __init__(self, title: str, body_text: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body_text = body_text
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="schema-panel"):
+            yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
+                         f"[dim]( m / Échap pour fermer )[/dim]", id="schema-title")
+            yield Static(self._body_text)
+
+    def action_dismiss_overlay(self) -> None:
+        self.dismiss()
+
+
+class DepGraphOverlay(ModalScreen):
+    """Affiche le graphe des dépendances entre packages par-dessus la liste."""
+
+    BINDINGS = [
+        Binding("g",      "dismiss_overlay", "Fermer", show=True),
+        Binding("escape", "dismiss_overlay", "Fermer", show=True),
+        Binding("q",      "dismiss_overlay", "Fermer", show=False),
+    ]
+
+    CSS = """
+    DepGraphOverlay { align: center middle; }
+    #depgraph-panel {
+        width: 92%;
+        height: 85%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #depgraph-title { text-style: bold; color: $accent; padding-bottom: 1; }
+    """
+
+    def __init__(self, title: str, body_text: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body_text = body_text
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="depgraph-panel"):
+            yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
+                         f"[dim]( g / Échap pour fermer )[/dim]", id="depgraph-title")
+            yield Static(self._body_text)
+
+    def action_dismiss_overlay(self) -> None:
+        self.dismiss()
+
+
 # ─── CSS ──────────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -1513,8 +1497,8 @@ class AliasMenu(App):
             n = len(self.tools_entries)
             self._status(
                 f"{n} point(s) d'entrée  ·  [t] arbre  [s] détails  [d] README  ·  "
-                f"[m]/[M] structure interne du package sélectionné (terminal/HTML)  ·  "
-                f"[g]/[G] dépendances ENTRE tous les packages (terminal/HTML)"
+                f"[m]/[M] structure interne du package sélectionné (texte/HTML)  ·  "
+                f"[g]/[G] dépendances ENTRE tous les packages (texte/HTML)"
             )
 
     # ── loaders ─────────────────────────────────────────────────────────────
@@ -1798,21 +1782,17 @@ class AliasMenu(App):
             return
         target_dir = Path(entry["tool_dir"])
         # Tient à jour le cache ARCHITECTURE.md (texte Mermaid, pour GitHub/lecture
-        # ultérieure) tout en affichant un rendu graphique directement dans le terminal.
+        # ultérieure) tout en affichant un résumé texte par-dessus la liste.
         architecture_diagram(target_dir, entry["tool"])
         src_root = _find_package_root(target_dir, entry["tool"])
-        self._status(f"Structure interne de {entry['tool']} (modules de CE package)  ·  cache : {target_dir / 'ARCHITECTURE.md'}")
-        with self.suspend():
-            if src_root is None:
-                print("\n\033[33mAucun code source Python trouvé pour générer un schéma\033[0m")
-            else:
-                py_files = _iter_py_files(src_root)
-                nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
-                print(f"\n\033[1;36m# Structure interne — {entry['tool']}\033[0m  \033[2m(modules au sein de ce package)\033[0m\n{'─'*60}")
-                err = _render_graph_terminal(nodes, edges, entry["tool"], omitted)
-                if err:
-                    print(f"\033[33m{err}\033[0m")
-            input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+        if src_root is None:
+            self._status("Aucun code source Python trouvé pour générer un schéma")
+            return
+        py_files = _iter_py_files(src_root)
+        nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
+        body = _format_module_structure(nodes, edges, omitted)
+        title = f"◆ {entry['tool']}  —  structure interne ({len(nodes)} modules)"
+        self.push_screen(SchemaOverlay(title, body))
 
     def action_show_mermaid_html(self) -> None:
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
@@ -1844,14 +1824,10 @@ class AliasMenu(App):
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
         self._status("Analyse des dépendances entre packages…")
-        with self.suspend():
-            nodes, edges, labels, omitted = build_dependency_graph(self.tools_entries)
-            print(f"\n\033[1;36m# Graphe des dépendances entre packages\033[0m\n{'─'*60}")
-            err = _render_graph_terminal(nodes, {(a, b) for a, b, _ in edges},
-                                          "Dépendances entre packages", omitted, labels)
-            if err:
-                print(f"\033[33m{err}\033[0m")
-            input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+        nodes, edges, labels, omitted = build_dependency_graph(self.tools_entries)
+        body = _format_dependency_text(nodes, edges, labels, omitted)
+        title = f"◆ Dépendances entre packages ({len(nodes)} packages, {len(edges)} liens)"
+        self.push_screen(DepGraphOverlay(title, body))
         self._status(f"{len(nodes)} package(s), {len(edges)} dépendance(s) détectée(s)")
 
     def action_show_dep_graph_html(self) -> None:
