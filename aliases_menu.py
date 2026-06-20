@@ -1352,6 +1352,42 @@ class DirTreeOverlay(ModalScreen):
         self.dismiss()
 
 
+class ReadmeOverlay(ModalScreen):
+    """Affiche le README d'un outil/projet par-dessus la liste."""
+
+    BINDINGS = [
+        Binding("d",      "dismiss_overlay", "Fermer", show=True),
+        Binding("escape", "dismiss_overlay", "Fermer", show=True),
+        Binding("q",      "dismiss_overlay", "Fermer", show=False),
+    ]
+
+    CSS = """
+    ReadmeOverlay { align: center middle; }
+    #readme-panel {
+        width: 92%;
+        height: 85%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #readme-title { text-style: bold; color: $accent; padding-bottom: 1; }
+    """
+
+    def __init__(self, title: str, readme_text: str) -> None:
+        super().__init__()
+        self._title = title
+        self._readme_text = readme_text
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="readme-panel"):
+            yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
+                         f"[dim]( d / Échap pour fermer )[/dim]", id="readme-title")
+            yield Static(self._readme_text)
+
+    def action_dismiss_overlay(self) -> None:
+        self.dismiss()
+
+
 # ─── CSS ──────────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -1396,9 +1432,9 @@ class AliasMenu(App):
         Binding("t",          "toggle_view",   "Arbre du dossier",   show=True),
         Binding("s",          "toggle_detail", "État/Structure", show=True),
         Binding("d",          "show_doc",      "Doc (README)", show=True),
-        Binding("m",          "show_mermaid",  "Schéma package", show=True),
-        Binding("g",          "show_dep_graph_terminal", "Graphe deps (term.)", show=True),
-        Binding("G",          "show_dep_graph_html",     "Graphe deps (HTML)", show=True),
+        Binding("m",          "show_mermaid",  "Structure interne (1 package)", show=True),
+        Binding("g",          "show_dep_graph_terminal", "Deps entre packages (term.)", show=True),
+        Binding("G",          "show_dep_graph_html",     "Deps entre packages (HTML)", show=True),
         # Changement d'onglet — priority=True pour passer avant le DataTable
         Binding("ctrl+right", "next_tab",   "Onglet →",     show=True,  priority=True),
         Binding("ctrl+left",  "prev_tab",   "← Onglet",     show=True,  priority=True),
@@ -1473,7 +1509,11 @@ class AliasMenu(App):
                 self._load_tools()
                 self._tools_loaded = True
             n = len(self.tools_entries)
-            self._status(f"{n} point(s) d'entrée  ·  [t] arbre  [s] détails  [d] README  [m] schéma  [g] deps(term.)  [G] deps(HTML)")
+            self._status(
+                f"{n} point(s) d'entrée  ·  [t] arbre  [s] détails  [d] README  ·  "
+                f"[m] structure interne du package sélectionné  ·  "
+                f"[g]/[G] dépendances ENTRE tous les packages (terminal/HTML)"
+            )
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -1737,39 +1777,36 @@ class AliasMenu(App):
             return
         target_dir = Path(entry["tool_dir"])
         readme = find_readme(target_dir)
-        self._status(f"README : {entry['tool']}")
-        with self.suspend():
-            if readme is None:
-                print(f"\n\033[33mAucun README trouvé dans {target_dir}\033[0m")
-                input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
-                return
-            header = f"\033[1;36m# {entry['tool']}\033[0m  \033[2m({readme.name})\033[0m\n{'─'*60}\n"
+        title = f"◆ {entry['tool']}  —  README"
+        if readme is None:
+            text = f"(aucun README trouvé dans {target_dir})"
+        else:
             try:
-                body = readme.read_text(errors="replace")
+                text = readme.read_text(errors="replace")
             except OSError:
-                body = "(impossible de lire le fichier)"
-            subprocess.run(["less", "-R"], input=(header + body + "\n").encode())
+                text = "(impossible de lire le fichier)"
+        self.push_screen(ReadmeOverlay(title, text))
 
     def action_show_mermaid(self) -> None:
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
         entry = self._current()
         if not entry:
-            self._status("Sélectionne un outil/projet pour générer son schéma")
+            self._status("Sélectionne un outil/projet pour voir sa structure interne")
             return
         target_dir = Path(entry["tool_dir"])
         # Tient à jour le cache ARCHITECTURE.md (texte Mermaid, pour GitHub/lecture
         # ultérieure) tout en affichant un rendu graphique directement dans le terminal.
         architecture_diagram(target_dir, entry["tool"])
         src_root = _find_package_root(target_dir, entry["tool"])
-        self._status(f"Schéma : {entry['tool']}  ·  cache : {target_dir / 'ARCHITECTURE.md'}")
+        self._status(f"Structure interne de {entry['tool']} (modules de CE package)  ·  cache : {target_dir / 'ARCHITECTURE.md'}")
         with self.suspend():
             if src_root is None:
                 print("\n\033[33mAucun code source Python trouvé pour générer un schéma\033[0m")
             else:
                 py_files = _iter_py_files(src_root)
                 nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
-                print(f"\n\033[1;36m# Schéma — {entry['tool']}\033[0m\n{'─'*60}")
+                print(f"\n\033[1;36m# Structure interne — {entry['tool']}\033[0m  \033[2m(modules au sein de ce package)\033[0m\n{'─'*60}")
                 err = _render_graph_terminal(nodes, edges, entry["tool"], omitted)
                 if err:
                     print(f"\033[33m{err}\033[0m")
