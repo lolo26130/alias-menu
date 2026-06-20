@@ -10,6 +10,7 @@ Lancement : uv run ~/scripts/aliases_menu.py   ou   am
 
 import ast
 import configparser
+import hashlib
 import json
 import os
 import random
@@ -1429,12 +1430,13 @@ class AliasMenu(App):
         Binding("space",      "run_entry",  "▶ Lancer",     show=True),
         Binding("h",          "show_help",  "? Man/Help",   show=True),
         Binding("r",          "reload",     "Recharger",    show=True),
-        Binding("t",          "toggle_view",   "Arbre du dossier",   show=True),
-        Binding("s",          "toggle_detail", "État/Structure", show=True),
-        Binding("d",          "show_doc",      "Doc (README)", show=True),
-        Binding("m",          "show_mermaid",  "Structure interne (1 package)", show=True),
-        Binding("g",          "show_dep_graph_terminal", "Deps entre packages (term.)", show=True),
-        Binding("G",          "show_dep_graph_html",     "Deps entre packages (HTML)", show=True),
+        Binding("t",          "toggle_view",   "Arbre",   show=True),
+        Binding("s",          "toggle_detail", "Détails", show=True),
+        Binding("d",          "show_doc",      "README", show=True),
+        Binding("m",          "show_mermaid",      "Pkg (M:HTML)", show=True),
+        Binding("M",          "show_mermaid_html", "Structure interne (HTML)", show=False),
+        Binding("g",          "show_dep_graph_terminal", "Deps (G:HTML)", show=True),
+        Binding("G",          "show_dep_graph_html",     "Deps entre packages (HTML)", show=False),
         # Changement d'onglet — priority=True pour passer avant le DataTable
         Binding("ctrl+right", "next_tab",   "Onglet →",     show=True,  priority=True),
         Binding("ctrl+left",  "prev_tab",   "← Onglet",     show=True,  priority=True),
@@ -1511,7 +1513,7 @@ class AliasMenu(App):
             n = len(self.tools_entries)
             self._status(
                 f"{n} point(s) d'entrée  ·  [t] arbre  [s] détails  [d] README  ·  "
-                f"[m] structure interne du package sélectionné  ·  "
+                f"[m]/[M] structure interne du package sélectionné (terminal/HTML)  ·  "
                 f"[g]/[G] dépendances ENTRE tous les packages (terminal/HTML)"
             )
 
@@ -1811,6 +1813,32 @@ class AliasMenu(App):
                 if err:
                     print(f"\033[33m{err}\033[0m")
             input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+
+    def action_show_mermaid_html(self) -> None:
+        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+            return
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne un outil/projet pour voir sa structure interne")
+            return
+        target_dir = Path(entry["tool_dir"])
+        architecture_diagram(target_dir, entry["tool"])
+        src_root = _find_package_root(target_dir, entry["tool"])
+        if src_root is None:
+            self._status("Aucun code source Python trouvé pour générer un schéma")
+            return
+        py_files = _iter_py_files(src_root)
+        nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
+        if not nodes:
+            self._status("Aucun module trouvé pour générer un schéma")
+            return
+        slug = re.sub(r"[^0-9A-Za-z_-]+", "_", entry["tool"])[:40]
+        digest = hashlib.sha1(str(target_dir).encode()).hexdigest()[:8]
+        out_path = Path.home() / ".cache" / "aliases_menu" / f"architecture_{slug}_{digest}.html"
+        title = f"Structure interne — {entry['tool']}" + (f"  ({omitted} non affiché(s))" if omitted else "")
+        _render_graph_html(nodes, {(a, b, "import") for a, b in edges}, title, out_path)
+        webbrowser.open(f"file://{out_path}")
+        self._status(f"Structure HTML ouverte dans le navigateur · {out_path}")
 
     def action_show_dep_graph_terminal(self) -> None:
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
