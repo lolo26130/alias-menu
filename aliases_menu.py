@@ -16,6 +16,7 @@ import os
 import re
 import readline
 import subprocess
+import textwrap
 import tomllib
 import webbrowser
 from datetime import datetime
@@ -860,23 +861,25 @@ def _collapse_node(parts: tuple[str, ...], pkg_root_name: str, depth: int = 2) -
     return ".".join(full[:depth])
 
 
-def _local_imports(path: Path, src_root: Path, pkg_root_name: str) -> list[tuple[str, ...]]:
+def _local_imports_detail(path: Path, src_root: Path, pkg_root_name: str) -> dict[tuple[str, ...], set[str]]:
     """Modules internes au package importés par ce fichier (imports absolus
-    préfixés par pkg_root_name, et imports relatifs résolus)."""
+    préfixés par pkg_root_name, et imports relatifs résolus), avec pour
+    chacun l'ensemble des symboles précis importés (vide si import du module
+    entier, ex: 'import pkg.sous_module')."""
     try:
         tree = ast.parse(path.read_text(errors="replace"))
     except (OSError, SyntaxError):
-        return []
+        return {}
 
     current_pkg = _module_parts(path, src_root)[:-1]
-    results: list[tuple[str, ...]] = []
+    results: dict[tuple[str, ...], set[str]] = {}
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 dotted = alias.name.split(".")
                 if dotted[0] == pkg_root_name:
-                    results.append(tuple(dotted[1:]))
+                    results.setdefault(tuple(dotted[1:]), set())
         elif isinstance(node, ast.ImportFrom):
             if node.level and node.level > 0:
                 up = node.level - 1
@@ -884,30 +887,38 @@ def _local_imports(path: Path, src_root: Path, pkg_root_name: str) -> list[tuple
                 mod_parts = list(base)
                 if node.module:
                     mod_parts += node.module.split(".")
-                results.append(tuple(mod_parts))
+                bucket = results.setdefault(tuple(mod_parts), set())
+                bucket.update(alias.name for alias in node.names)
             elif node.module:
                 dotted = node.module.split(".")
                 if dotted[0] == pkg_root_name:
-                    results.append(tuple(dotted[1:]))
+                    bucket = results.setdefault(tuple(dotted[1:]), set())
+                    bucket.update(alias.name for alias in node.names)
 
     return results
 
 
-def _diagram_graph(py_files: list[Path], src_root: Path, pkg_root_name: str) -> tuple[set[str], set[tuple[str, str]], int]:
-    """Calcule le graphe (nœuds, arêtes, nb omis) des dépendances internes du
-    package : modules collapsés à 2 niveaux, et bridé à un nombre de nœuds
-    raisonnable (les plus connectés, en priorité) pour rester lisible."""
+def _diagram_graph(
+    py_files: list[Path], src_root: Path, pkg_root_name: str
+) -> tuple[set[str], set[tuple[str, str]], int, dict[tuple[str, str], set[str]]]:
+    """Calcule le graphe (nœuds, arêtes, nb omis, symboles par arête) des
+    dépendances internes du package : modules collapsés à 2 niveaux, et bridé
+    à un nombre de nœuds raisonnable (les plus connectés, en priorité) pour
+    rester lisible."""
     nodes: set[str] = set()
     edges: set[tuple[str, str]] = set()
+    edge_symbols: dict[tuple[str, str], set[str]] = {}
 
     for f in py_files:
         cur = _collapse_node(_module_parts(f, src_root), pkg_root_name)
         nodes.add(cur)
-        for imp_parts in _local_imports(f, src_root, pkg_root_name):
+        for imp_parts, symbols in _local_imports_detail(f, src_root, pkg_root_name).items():
             imp = _collapse_node(imp_parts, pkg_root_name)
             nodes.add(imp)
             if imp != cur:
                 edges.add((cur, imp))
+                if symbols:
+                    edge_symbols.setdefault((cur, imp), set()).update(symbols)
 
     omitted = 0
     if len(nodes) > _DIAGRAM_MAX_NODES:
@@ -920,8 +931,9 @@ def _diagram_graph(py_files: list[Path], src_root: Path, pkg_root_name: str) -> 
         omitted = len(nodes) - len(keep)
         nodes = keep
         edges = {(a, b) for a, b in edges if a in keep and b in keep}
+        edge_symbols = {(a, b): s for (a, b), s in edge_symbols.items() if a in keep and b in keep}
 
-    return nodes, edges, omitted
+    return nodes, edges, omitted, edge_symbols
 
 
 def _mermaid_safe_id(n: str) -> str:
@@ -930,7 +942,7 @@ def _mermaid_safe_id(n: str) -> str:
 
 def _build_mermaid(py_files: list[Path], src_root: Path, pkg_root_name: str) -> str:
     """Construit un flowchart Mermaid résumé des dépendances internes du package."""
-    nodes, edges, omitted = _diagram_graph(py_files, src_root, pkg_root_name)
+    nodes, edges, omitted, _edge_symbols = _diagram_graph(py_files, src_root, pkg_root_name)
 
     lines = ["flowchart TD"]
     for n in sorted(nodes):
@@ -979,12 +991,14 @@ def architecture_diagram(tool_dir: Path, pkg_name: str) -> str:
 
 # ─── Rendu graphique (terminal & HTML) ─────────────────────────────────────────
 
-def _format_module_structure(nodes: set[str], edges: set[tuple[str, str]], omitted: int) -> str:
+def _format_module_structure(nodes: set[str], edges: set[tuple[str, str]], omitted: int,
+                              edge_symbols: dict[tuple[str, str], set[str]] | None = None) -> str:
     """Représentation textuelle (liste d'adjacence indentée, façon `pipdeptree`)
     de la structure interne d'un package — bien plus lisible dans un terminal
     qu'un dessin ASCII/braille où les étiquettes finissent par se chevaucher."""
     if not nodes:
         return "(aucun module trouvé)"
+    edge_symbols = edge_symbols or {}
     by_node: dict[str, list[str]] = {n: [] for n in nodes}
     for a, b in edges:
         by_node.setdefault(a, []).append(b)
@@ -993,19 +1007,33 @@ def _format_module_structure(nodes: set[str], edges: set[tuple[str, str]], omitt
     for n in sorted(nodes):
         lines.append(n)
         for target in sorted(set(by_node.get(n, []))):
-            lines.append(f"  └─ {target}")
+            symbols = sorted(edge_symbols.get((n, target), ()))
+            detail = ""
+            if symbols:
+                shown = ", ".join(symbols[:_MAX_EDGE_SYMBOLS_SHOWN])
+                extra = len(symbols) - _MAX_EDGE_SYMBOLS_SHOWN
+                if extra > 0:
+                    shown += f", … (+{extra})"
+                detail = f"  ({shown})"
+            lines.append(f"  └─ {target}{detail}")
     if omitted:
         lines.append(f"\n… {omitted} module(s) supplémentaire(s) non affiché(s) (les plus connectés sont prioritaires)")
     return "\n".join(lines)
 
 
+_MAX_EDGE_SYMBOLS_SHOWN = 3
+
+
 def _format_dependency_text(nodes: set[str], edges: set[tuple[str, str, str]],
-                             labels: dict[str, str], omitted: int) -> str:
+                             labels: dict[str, str], omitted: int,
+                             edge_symbols: dict[tuple[str, str], set[str]] | None = None) -> str:
     """Représentation textuelle (liste d'adjacence indentée) des dépendances
     entre packages — chaque package, suivi de ce dont il dépend, avec le
-    signal détecté (import réel vs dépendance déclarée)."""
+    signal détecté (import réel vs dépendance déclarée) et, pour les imports,
+    les symboles/sous-modules précis importés."""
     if not nodes:
         return "(aucune dépendance détectée entre les packages)"
+    edge_symbols = edge_symbols or {}
     by_node: dict[str, list[tuple[str, str]]] = {n: [] for n in nodes}
     for a, b, kind in edges:
         by_node.setdefault(a, []).append((b, kind))
@@ -1016,24 +1044,43 @@ def _format_dependency_text(nodes: set[str], edges: set[tuple[str, str, str]],
         targets = sorted(set(by_node.get(n, [])), key=lambda tk: labels.get(tk[0], tk[0]).lower())
         for target, kind in targets:
             tag = "déclarée" if kind == "declared" else "import"
-            lines.append(f"  → {labels.get(target, target)}  ({tag})")
+            detail = ""
+            if kind == "import":
+                symbols = sorted(edge_symbols.get((n, target), ()))
+                if symbols:
+                    shown = ", ".join(symbols[:_MAX_EDGE_SYMBOLS_SHOWN])
+                    extra = len(symbols) - _MAX_EDGE_SYMBOLS_SHOWN
+                    if extra > 0:
+                        shown += f", … (+{extra})"
+                    detail = f" : {shown}"
+            lines.append(f"  → {labels.get(target, target)}  ({tag}{detail})")
     if omitted:
         lines.append(f"\n… {omitted} package(s) non affiché(s) (isolés ou moins connectés)")
     return "\n".join(lines)
 
 
 def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, str]] | list[tuple[str, str, str]],
-                        title: str, out_path: Path, labels: dict[str, str] | None = None) -> Path:
+                        title: str, out_path: Path, labels: dict[str, str] | None = None,
+                        edge_symbols: dict[tuple[str, str], set[str]] | None = None) -> Path:
     """Génère une page HTML autonome (vis-network via CDN) avec une mise en
     page physique réellement élastique/interactive (zoom, glisser-déposer) —
     le rendu 'comme en analyse web' demandé, ouvert dans le navigateur."""
     labels = labels or {}
+    edge_symbols = edge_symbols or {}
     vis_nodes = [{"id": n, "label": labels.get(n, n)} for n in nodes]
-    vis_edges = [
-        {"from": a, "to": b, "color": {"color": "#e67e22" if kind == "declared" else "#3498db"},
-         "arrows": "to", "title": kind}
-        for a, b, kind in edges
-    ]
+    vis_edges = []
+    for a, b, kind in edges:
+        tooltip = "déclarée" if kind == "declared" else "import"
+        if kind == "import":
+            symbols = sorted(edge_symbols.get((a, b), ()))
+            if symbols:
+                tooltip = "import : " + ", ".join(symbols)
+        tooltip = textwrap.fill(tooltip, width=50)
+        vis_edges.append({
+            "from": a, "to": b,
+            "color": {"color": "#e67e22" if kind == "declared" else "#3498db"},
+            "arrows": "to", "title": tooltip,
+        })
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -1044,6 +1091,7 @@ def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, s
   html, body {{ margin: 0; height: 100%; background: #1e1e1e; font-family: sans-serif; }}
   #title {{ color: #eee; padding: 8px 14px; font-size: 16px; }}
   #graph {{ width: 100%; height: calc(100% - 40px); }}
+  div.vis-tooltip {{ white-space: pre-line !important; max-width: 480px; }}
 </style>
 </head>
 <body>
@@ -1111,10 +1159,12 @@ def _declared_dependency_names(tool_dir: Path) -> set[str]:
     return names
 
 
-def _external_top_imports(tool_dir: Path) -> set[str]:
+def _external_imports_detail(tool_dir: Path) -> dict[str, set[str]]:
     """Premiers segments de tous les imports (hors stdlib filtré implicitement
-    par l'absence de correspondance) trouvés dans les .py du projet, normalisés."""
-    names: set[str] = set()
+    par l'absence de correspondance) trouvés dans les .py du projet, normalisés,
+    avec pour chacun l'ensemble des symboles/sous-modules précis importés
+    (ex: 'gen_exclude_libraries_to_compile' pour 'from Outils import ...')."""
+    detail: dict[str, set[str]] = {}
     for f in _iter_py_files(tool_dir):
         try:
             tree = ast.parse(f.read_text(errors="replace"))
@@ -1123,23 +1173,35 @@ def _external_top_imports(tool_dir: Path) -> set[str]:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    names.add(_norm_pkg_name(alias.name.split(".")[0]))
+                    parts = alias.name.split(".")
+                    key = _norm_pkg_name(parts[0])
+                    bucket = detail.setdefault(key, set())
+                    if len(parts) > 1:
+                        bucket.add(".".join(parts[1:]))
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names.add(_norm_pkg_name(node.module.split(".")[0]))
-    return names
+                mod_parts = node.module.split(".")
+                key = _norm_pkg_name(mod_parts[0])
+                rest = ".".join(mod_parts[1:])
+                bucket = detail.setdefault(key, set())
+                for alias in node.names:
+                    bucket.add(f"{rest}.{alias.name}" if rest else alias.name)
+    return detail
 
 
 _DEP_GRAPH_MAX_NODES = 60
 
 
-def build_dependency_graph(entries: list[dict]) -> tuple[set[str], set[tuple[str, str, str]], dict[str, str], int]:
+def build_dependency_graph(
+    entries: list[dict],
+) -> tuple[set[str], set[tuple[str, str, str]], dict[str, str], int, dict[tuple[str, str], set[str]]]:
     """Construit le graphe des dépendances entre TOUS les packages trouvés
     (uv-tool / projets uv / pip --editable), à partir de deux signaux :
     - imports détectés dans le code source référençant le nom (module ou
       distribution) d'un autre package du catalogue ;
     - dépendances déclarées (pyproject.toml / setup.cfg) qui correspondent au
       nom d'un autre package du catalogue.
-    Retourne (nœuds, arêtes(src,dst,kind), labels{id: nom affiché}, nb omis)."""
+    Retourne (nœuds, arêtes(src,dst,kind), labels{id: nom affiché}, nb omis,
+    symboles{(src,dst): symboles/sous-modules importés précisément})."""
     packages: dict[str, dict] = {}
     for e in entries:
         tool_dir = e["tool_dir"]
@@ -1159,13 +1221,15 @@ def build_dependency_graph(entries: list[dict]) -> tuple[set[str], set[tuple[str
             norm_to_id.setdefault(c, tool_dir)
 
     edges: set[tuple[str, str, str]] = set()
+    edge_symbols: dict[tuple[str, str], set[str]] = {}
 
     for tool_dir, info in packages.items():
         d = Path(tool_dir)
-        for imp in _external_top_imports(d):
+        for imp, symbols in _external_imports_detail(d).items():
             target = norm_to_id.get(imp)
             if target and target != tool_dir:
                 edges.add((tool_dir, target, "import"))
+                edge_symbols.setdefault((tool_dir, target), set()).update(symbols)
         for dep in _declared_dependency_names(d):
             target = norm_to_id.get(dep)
             if target and target != tool_dir:
@@ -1188,9 +1252,10 @@ def build_dependency_graph(entries: list[dict]) -> tuple[set[str], set[tuple[str
         omitted += len(nodes) - len(keep)
         nodes = keep
         edges = {(a, b, k) for a, b, k in edges if a in keep and b in keep}
+        edge_symbols = {(a, b): s for (a, b), s in edge_symbols.items() if a in keep and b in keep}
 
     labels = {tool_dir: packages[tool_dir]["label"] for tool_dir in nodes}
-    return nodes, edges, labels, omitted
+    return nodes, edges, labels, omitted, edge_symbols
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1789,8 +1854,8 @@ class AliasMenu(App):
             self._status("Aucun code source Python trouvé pour générer un schéma")
             return
         py_files = _iter_py_files(src_root)
-        nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
-        body = _format_module_structure(nodes, edges, omitted)
+        nodes, edges, omitted, edge_symbols = _diagram_graph(py_files, src_root, src_root.name)
+        body = _format_module_structure(nodes, edges, omitted, edge_symbols)
         title = f"◆ {entry['tool']}  —  structure interne ({len(nodes)} modules)"
         self.push_screen(SchemaOverlay(title, body))
 
@@ -1808,7 +1873,7 @@ class AliasMenu(App):
             self._status("Aucun code source Python trouvé pour générer un schéma")
             return
         py_files = _iter_py_files(src_root)
-        nodes, edges, omitted = _diagram_graph(py_files, src_root, src_root.name)
+        nodes, edges, omitted, edge_symbols = _diagram_graph(py_files, src_root, src_root.name)
         if not nodes:
             self._status("Aucun module trouvé pour générer un schéma")
             return
@@ -1816,7 +1881,8 @@ class AliasMenu(App):
         digest = hashlib.sha1(str(target_dir).encode()).hexdigest()[:8]
         out_path = Path.home() / ".cache" / "aliases_menu" / f"architecture_{slug}_{digest}.html"
         title = f"Structure interne — {entry['tool']}" + (f"  ({omitted} non affiché(s))" if omitted else "")
-        _render_graph_html(nodes, {(a, b, "import") for a, b in edges}, title, out_path)
+        _render_graph_html(nodes, {(a, b, "import") for a, b in edges}, title, out_path,
+                            edge_symbols={(a, b): s for (a, b), s in edge_symbols.items()})
         webbrowser.open(f"file://{out_path}")
         self._status(f"Structure HTML ouverte dans le navigateur · {out_path}")
 
@@ -1824,8 +1890,8 @@ class AliasMenu(App):
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
         self._status("Analyse des dépendances entre packages…")
-        nodes, edges, labels, omitted = build_dependency_graph(self.tools_entries)
-        body = _format_dependency_text(nodes, edges, labels, omitted)
+        nodes, edges, labels, omitted, edge_symbols = build_dependency_graph(self.tools_entries)
+        body = _format_dependency_text(nodes, edges, labels, omitted, edge_symbols)
         title = f"◆ Dépendances entre packages ({len(nodes)} packages, {len(edges)} liens)"
         self.push_screen(DepGraphOverlay(title, body))
         self._status(f"{len(nodes)} package(s), {len(edges)} dépendance(s) détectée(s)")
@@ -1834,13 +1900,13 @@ class AliasMenu(App):
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
         self._status("Analyse des dépendances entre packages…")
-        nodes, edges, labels, omitted = build_dependency_graph(self.tools_entries)
+        nodes, edges, labels, omitted, edge_symbols = build_dependency_graph(self.tools_entries)
         if not nodes:
             self._status("Aucune dépendance détectée entre les packages")
             return
         out_path = Path.home() / ".cache" / "aliases_menu" / "dep_graph.html"
         title = f"Dépendances entre packages ({len(nodes)} packages, {omitted} non affiché(s))"
-        _render_graph_html(nodes, edges, title, out_path, labels)
+        _render_graph_html(nodes, edges, title, out_path, labels, edge_symbols)
         webbrowser.open(f"file://{out_path}")
         self._status(f"Graphe HTML ouvert dans le navigateur · {out_path}")
 
