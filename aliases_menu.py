@@ -33,7 +33,8 @@ FUNCTIONS_FILE = Path.home() / ".bash_functions"
 UV_TOOLS_DIR   = Path.home() / ".local" / "share" / "uv" / "tools"
 # Arborescences scannées pour trouver des projets gérés par uv (pyproject.toml + uv.lock).
 # Ajoute d'autres répertoires ici si besoin.
-UV_PROJECT_DIRS = [Path.home() / "Documents" / "Python"]
+UV_PROJECT_DIRS = [Path.home() / "Documents" / "Python", 
+                    Path.home() / "Documents" / "Python" / "aaa_modules"]
 _PROJECT_SCAN_PRUNE = {
     ".venv", "venv", "__pycache__", ".git", "node_modules",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
@@ -318,6 +319,8 @@ def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
     projets gérés par uv (pyproject.toml + uv.lock / [tool.uv] / venv créé par uv),
     et en extrait les points d'entrée déclarés dans [project.scripts]."""
     entries: list[dict] = []
+    roots_set = {str(r) for r in roots}
+    seen: set[str] = set()
     for root in roots:
         if not root.is_dir():
             continue
@@ -333,7 +336,7 @@ def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
             ]
             if depth >= max_depth:
                 dirnames[:] = []
-            if "pyproject.toml" not in filenames:
+            if "pyproject.toml" not in filenames or str(d) in roots_set or str(d) in seen:
                 continue
 
             try:
@@ -387,6 +390,7 @@ def find_uv_projects(roots: list[Path], max_depth: int = 6) -> list[dict]:
                 })
 
             # ne pas redescendre dans un projet déjà identifié
+            seen.add(str(d))
             dirnames[:] = []
 
     return entries
@@ -657,6 +661,8 @@ def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str], max_depth
                 }
 
     entries: list[dict] = []
+    roots_set = {str(r) for r in roots}
+    seen: set[str] = set()
     for root in roots:
         if not root.is_dir():
             continue
@@ -669,7 +675,7 @@ def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str], max_depth
             ]
             if depth >= max_depth:
                 dirnames[:] = []
-            if str(d) in skip_dirs or not _pip_project_health(d):
+            if str(d) in roots_set or str(d) in skip_dirs or str(d) in seen or not _pip_project_health(d):
                 continue
 
             confirmed = installed.get(str(d))
@@ -718,7 +724,43 @@ def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str], max_depth
                     "is_root":  True,
                 })
 
+            seen.add(str(d))
             dirnames[:] = []
+
+    # Dédupliquer les packages non-confirmés (venv_dir == tool_dir) de même
+    # (nom, version) : une copie de travail dans un sous-dossier temporaire
+    # (ex: Qt6/test_conversion/…) peut avoir un descripteur identique.
+    # On garde l'occurrence la moins profonde par rapport à la racine de scan
+    # la plus proche — c'est le plus souvent la version canonique dans aaa_modules.
+    def _depth_from_roots(tool_dir: str) -> int:
+        p = Path(tool_dir)
+        best = 9999
+        for r in roots:
+            try:
+                best = min(best, len(p.relative_to(r).parts))
+            except ValueError:
+                pass
+        return best
+
+    confirmed_dirs = {e["tool_dir"] for e in entries if e["venv_dir"] != e["tool_dir"]}
+    seen_uc: dict[tuple[str, str], int] = {}   # (nom_lower, version) → index retenu
+    to_keep: list[bool] = []
+    for i, e in enumerate(entries):
+        if e["tool_dir"] in confirmed_dirs:
+            to_keep.append(True)
+            continue
+        key = (e["name"].lower(), e["version"])
+        prev = seen_uc.get(key)
+        if prev is None:
+            seen_uc[key] = i
+            to_keep.append(True)
+        elif _depth_from_roots(e["tool_dir"]) < _depth_from_roots(entries[prev]["tool_dir"]):
+            to_keep[prev] = False
+            seen_uc[key] = i
+            to_keep.append(True)
+        else:
+            to_keep.append(False)
+    entries = [e for e, keep in zip(entries, to_keep) if keep]
 
     return entries
 
@@ -731,6 +773,18 @@ def parse_uv_tools() -> list[dict]:
     project_entries = find_uv_projects(UV_PROJECT_DIRS)
     uv_project_dirs = {e["tool_dir"] for e in project_entries}
     pip_entries = find_pip_editable_projects(UV_PROJECT_DIRS, uv_project_dirs)
+
+    # Déduplication cross-sources : un pip-editable non confirmé (pas de venv réel)
+    # dont le nom de package coïncide avec un projet uv est redondant — la version
+    # uv est la référence canonique. On le supprime pour éviter les doublons dans
+    # le graphe de dépendances (faux nœuds, faux arcs).
+    uv_names = {e["tool"].lower() for e in uv_tool_entries + project_entries}
+    pip_entries = [
+        e for e in pip_entries
+        if e["venv_dir"] != e["tool_dir"]          # confirmé → toujours gardé
+        or e["tool"].lower() not in uv_names        # non confirmé mais nom unique → gardé
+    ]
+
     return uv_tool_entries + project_entries + pip_entries
 
 
