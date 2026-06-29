@@ -1697,9 +1697,9 @@ class AliasMenu(App):
         self._load_duplicates()
 
     _SOURCE_LABELS = {
-        "uv-tool":      "Outils uv (uv tool install)",
-        "project":      f"Projets uv ({', '.join(str(p) for p in UV_PROJECT_DIRS)})",
-        "pip-editable": f"Projets pip --editable ({', '.join(str(p) for p in UV_PROJECT_DIRS)})",
+        "uv-tool":      "uv tool install",
+        "project":      "projets uv",
+        "pip-editable": "pip --editable",
     }
     _SOURCE_TAGS = {"uv-tool": "uv tool", "project": "projet uv", "pip-editable": "pip -e"}
 
@@ -1719,8 +1719,8 @@ class AliasMenu(App):
                 label = self._SOURCE_LABELS.get(current_source) or current_source or ""
                 t.add_row(
                     "", "",
+                    "[dim cyan]" + "─" * 8 + "[/dim cyan]",
                     f"[bold bright_cyan]  ◆  {label}[/bold bright_cyan]",
-                    "[dim cyan]" + "─" * 38 + "[/dim cyan]",
                     "", "", "",
                     key=f"tsh{len(self._tool_rows)}",
                 )
