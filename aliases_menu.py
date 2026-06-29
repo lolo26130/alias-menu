@@ -1828,6 +1828,12 @@ class AliasMenu(App):
     # ── action : run ────────────────────────────────────────────────────────
 
     def action_run_entry(self) -> None:
+        active = self._active_tab()
+        if active in ("tab-tools", "tab-dups"):
+            entry = self._current()
+            if entry:
+                self._open_file_manager(entry["tool_dir"])
+            return
         entry = self._current()
         if not entry:
             return
@@ -1837,6 +1843,10 @@ class AliasMenu(App):
             self._run_function(entry)
         else:
             self._run_tool(entry)
+
+    def _open_file_manager(self, path: str) -> None:
+        subprocess.Popen(["xdg-open", path])
+        self._status(f"Explorateur ouvert : {path}")
 
     def _run_alias(self, e: dict) -> None:
         self._status(f"Lancement : {e['name']}  →  {e['cmd']}")
