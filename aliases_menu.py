@@ -49,6 +49,26 @@ _PROJECT_SCAN_PRUNE = {
 _THIRDPARTY_ANCESTOR_NAMES = {"old", "libraries", "exemple_python_repo", "tests_exemples", "doc_python", "examples"}
 
 
+def _short_path(path: str | Path) -> str:
+    """Chemin relatif à la racine UV_PROJECT_DIRS la plus spécifique, ou ~/… sinon."""
+    p = Path(path)
+    best_depth, best_rel = -1, ""
+    for root in UV_PROJECT_DIRS:
+        try:
+            rel = str(p.relative_to(root))
+            depth = len(root.parts)
+            if depth > best_depth:
+                best_depth, best_rel = depth, rel if rel != "." else ""
+        except ValueError:
+            pass
+    if best_depth >= 0:
+        return best_rel or p.name
+    try:
+        return "~/" + str(p.relative_to(Path.home()))
+    except ValueError:
+        return str(p)
+
+
 def _looks_like_thirdparty(d: Path, roots: list[Path]) -> bool:
     name_lower = d.name.lower()
     if name_lower.endswith("master") or name_lower.endswith("-main") or name_lower == "main":
@@ -1123,15 +1143,58 @@ def _format_dependency_text(nodes: set[str], edges: set[tuple[str, str, str]],
     return "\n".join(lines)
 
 
+_PATH_OPENER_PORT: int | None = None
+
+
+def _ensure_path_opener_server() -> int:
+    """Démarre (une seule fois) un serveur HTTP local qui reçoit les clics du
+    navigateur sur un nœud du graphe et ouvre le répertoire correspondant dans
+    dolphin.  Retourne le port alloué dynamiquement."""
+    global _PATH_OPENER_PORT
+    if _PATH_OPENER_PORT is not None:
+        return _PATH_OPENER_PORT
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/open":
+                path = parse_qs(parsed.query).get("path", [""])[0]
+                if path:
+                    subprocess.Popen(
+                        ["dolphin", "--new-tab", path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    _PATH_OPENER_PORT = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return _PATH_OPENER_PORT
+
+
 def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, str]] | list[tuple[str, str, str]],
                         title: str, out_path: Path, labels: dict[str, str] | None = None,
-                        edge_symbols: dict[tuple[str, str], set[str]] | None = None) -> Path:
+                        edge_symbols: dict[tuple[str, str], set[str]] | None = None,
+                        node_titles: dict[str, str] | None = None,
+                        opener_port: int | None = None) -> Path:
     """Génère une page HTML autonome (vis-network via CDN) avec une mise en
     page physique réellement élastique/interactive (zoom, glisser-déposer) —
     le rendu 'comme en analyse web' demandé, ouvert dans le navigateur."""
     labels = labels or {}
     edge_symbols = edge_symbols or {}
-    vis_nodes = [{"id": n, "label": labels.get(n, n)} for n in nodes]
+    titles = node_titles or {}
+    vis_nodes = [{"id": n, "label": labels.get(n, n), "title": titles.get(n, "")} for n in nodes]
     vis_edges = []
     for a, b, kind in edges:
         tooltip = "déclarée" if kind == "declared" else "import"
@@ -1145,6 +1208,16 @@ def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, s
             "color": {"color": "#e67e22" if kind == "declared" else "#3498db"},
             "arrows": "to", "title": tooltip,
         })
+    click_js = ""
+    if opener_port:
+        click_js = (
+            f"  network.on('click', function(params) {{\n"
+            f"    if (params.nodes.length > 0) {{\n"
+            f"      fetch('http://127.0.0.1:{opener_port}/open?path=' + encodeURIComponent(params.nodes[0]))\n"
+            f"        .catch(function() {{}});\n"
+            f"    }}\n"
+            f"  }});\n"
+        )
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -1172,8 +1245,8 @@ def _render_graph_html(nodes: set[str] | list[str], edges: set[tuple[str, str, s
     physics: {{ solver: 'forceAtlas2Based', forceAtlas2Based: {{ gravitationalConstant: -60, springLength: 120 }}, stabilization: {{ iterations: 200 }} }},
     interaction: {{ hover: true, tooltipDelay: 100 }}
   }};
-  new vis.Network(container, data, options);
-</script>
+  const network = new vis.Network(container, data, options);
+{click_js}</script>
 </body>
 </html>
 """
@@ -1729,7 +1802,7 @@ class AliasMenu(App):
             if detail:
                 info1, info2 = tool_install_state(e), tool_structure_summary(e["venv_dir"])
             else:
-                info1, info2 = e["python"], e["path"]
+                info1, info2 = e["python"], _short_path(e["path"])
             source_cell = f"[dim]{self._SOURCE_TAGS.get(e['source'], e['source'])}[/dim]"
             entry_label = f"{e['name']} [dim](dossier projet)[/dim]" if e.get("is_root") else e["name"]
             t.add_row(
@@ -1774,10 +1847,10 @@ class AliasMenu(App):
             )
             self._dup_rows.append(None)
             for e in group:
-                canon_name = os.path.basename(e.get("_dup_canonical", "")) or "—"
+                canon_name = _short_path(e.get("_dup_canonical", "")) or "—"
                 root = Path(e["tool_dir"])
                 tree_lines = render_dir_tree(root, max_depth=1, max_per_dir=10).splitlines()
-                tree_lines[0] = root.name + "/"
+                tree_lines[0] = _short_path(root) + "/"
                 tree = "\n".join(tree_lines)
                 t.add_row(
                     f"[dim]{sec_label}[/dim]",
@@ -1853,7 +1926,7 @@ class AliasMenu(App):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self._status(f"Explorateur ouvert : {path}")
+        self._status(f"Explorateur ouvert : {_short_path(path)}")
 
     def _run_alias(self, e: dict) -> None:
         self._status(f"Lancement : {e['name']}  →  {e['cmd']}")
@@ -1962,7 +2035,7 @@ class AliasMenu(App):
             self._status("Sélectionne un outil/projet pour voir son arbre d'installation")
             return
         target_dir = Path(entry["tool_dir"])
-        title = f"◆ {entry['tool']}  —  {target_dir}"
+        title = f"◆ {entry['tool']}  —  {_short_path(target_dir)}"
         self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
 
     def action_toggle_detail(self) -> None:
@@ -2059,9 +2132,12 @@ class AliasMenu(App):
             return
         out_path = Path.home() / ".cache" / "aliases_menu" / "dep_graph.html"
         title = f"Dépendances entre packages ({len(nodes)} packages, {omitted} non affiché(s))"
-        _render_graph_html(nodes, edges, title, out_path, labels, edge_symbols)
+        node_titles = {td: _short_path(td) for td in nodes}
+        port = _ensure_path_opener_server()
+        _render_graph_html(nodes, edges, title, out_path, labels, edge_symbols,
+                           node_titles=node_titles, opener_port=port)
         webbrowser.open(f"file://{out_path}")
-        self._status(f"Graphe HTML ouvert dans le navigateur · {out_path}")
+        self._status(f"Graphe HTML ouvert dans le navigateur · {out_path}  [clic sur nœud → dolphin]")
 
     # ── action : reload ─────────────────────────────────────────────────────
 
