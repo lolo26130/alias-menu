@@ -73,7 +73,7 @@ _TOOL_HEADER_RE = re.compile(r"^(\S+)\s+v(\S+)\s+\[(.*?)\]\s+\((.*?)\)$")
 _TOOL_ENTRY_RE  = re.compile(r"^-\s+(\S+)\s+\((.*?)\)$")
 _SITE_PKG_NOISE = {"__pycache__", "_virtualenv.py", "_virtualenv.pth"}
 
-TAB_IDS = ["tab-alias", "tab-func", "tab-tools"]
+TAB_IDS = ["tab-alias", "tab-func", "tab-tools", "tab-dups"]
 
 
 # ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -755,37 +755,47 @@ def find_pip_editable_projects(roots: list[Path], skip_dirs: set[str], max_depth
             seen_uc[key] = i
             to_keep.append(True)
         elif _depth_from_roots(e["tool_dir"]) < _depth_from_roots(entries[prev]["tool_dir"]):
+            entries[prev]["_dup_reason"] = "copie"
+            entries[prev]["_dup_canonical"] = e["tool_dir"]
             to_keep[prev] = False
             seen_uc[key] = i
             to_keep.append(True)
         else:
+            e["_dup_reason"] = "copie"
+            e["_dup_canonical"] = entries[seen_uc[key]]["tool_dir"]
             to_keep.append(False)
-    entries = [e for e, keep in zip(entries, to_keep) if keep]
+    kept = [e for e, k in zip(entries, to_keep) if k]
+    dups = [e for e, k in zip(entries, to_keep) if not k]
+    return kept, dups
 
-    return entries
 
-
-def parse_uv_tools() -> list[dict]:
+def parse_uv_tools() -> tuple[list[dict], list[dict]]:
     """Combine les outils installés globalement (`uv tool install`), les
     projets uv trouvés sous UV_PROJECT_DIRS, et les projets pip --editable
-    (même arborescence, hors dossiers déjà classés comme uv)."""
+    (même arborescence, hors dossiers déjà classés comme uv).
+    Retourne (entrées_retenues, doublons_filtrés)."""
     uv_tool_entries = _parse_uv_tool_installs()
     project_entries = find_uv_projects(UV_PROJECT_DIRS)
     uv_project_dirs = {e["tool_dir"] for e in project_entries}
-    pip_entries = find_pip_editable_projects(UV_PROJECT_DIRS, uv_project_dirs)
+    pip_entries, pip_dups = find_pip_editable_projects(UV_PROJECT_DIRS, uv_project_dirs)
 
     # Déduplication cross-sources : un pip-editable non confirmé (pas de venv réel)
     # dont le nom de package coïncide avec un projet uv est redondant — la version
-    # uv est la référence canonique. On le supprime pour éviter les doublons dans
-    # le graphe de dépendances (faux nœuds, faux arcs).
+    # uv est la référence canonique.
     uv_names = {e["tool"].lower() for e in uv_tool_entries + project_entries}
-    pip_entries = [
-        e for e in pip_entries
-        if e["venv_dir"] != e["tool_dir"]          # confirmé → toujours gardé
-        or e["tool"].lower() not in uv_names        # non confirmé mais nom unique → gardé
-    ]
+    filtered_pip: list[dict] = []
+    cross_dups: list[dict] = []
+    for e in pip_entries:
+        if e["venv_dir"] != e["tool_dir"] or e["tool"].lower() not in uv_names:
+            filtered_pip.append(e)
+        else:
+            canon = next((x for x in uv_tool_entries + project_entries
+                          if x["tool"].lower() == e["tool"].lower()), None)
+            e["_dup_reason"] = "pip/uv"
+            e["_dup_canonical"] = canon["tool_dir"] if canon else ""
+            cross_dups.append(e)
 
-    return uv_tool_entries + project_entries + pip_entries
+    return uv_tool_entries + project_entries + filtered_pip, pip_dups + cross_dups
 
 
 def tool_install_state(e: dict) -> str:
@@ -1555,8 +1565,10 @@ class AliasMenu(App):
                 yield DataTable(id="alias-table", zebra_stripes=True, cursor_type="row")
             with TabPane("  Fonctions  ", id="tab-func"):
                 yield DataTable(id="func-table", zebra_stripes=True, cursor_type="row")
-            with TabPane("  Outils uv  ", id="tab-tools"):
+            with TabPane("  packages pip/uv  ", id="tab-tools"):
                 yield DataTable(id="tools-table", zebra_stripes=True, cursor_type="row")
+            with TabPane("  Duplicates  ", id="tab-dups"):
+                yield DataTable(id="dups-table", zebra_stripes=True, cursor_type="row")
         yield Label("", id="status")
         yield Footer()
 
@@ -1564,10 +1576,13 @@ class AliasMenu(App):
         self._load_aliases()
         self._load_functions()
         self.tools_entries: list[dict] = []
+        self.dups_entries:  list[dict] = []
         self._tool_rows: list[dict | None] = []
+        self._dup_rows:  list[dict | None] = []
         self._tools_loaded = False
         self._tools_detail = False
         self._init_tools_placeholder()
+        self._init_dups_placeholder()
         self.query_one("#alias-table", DataTable).focus()
 
     def _init_tools_placeholder(self) -> None:
@@ -1575,6 +1590,12 @@ class AliasMenu(App):
         t.clear(columns=True)
         t.add_columns("  ▶ Run  ", "  ? Man  ", "Outil", "Point d'entrée", "Python", "Chemin")
         t.add_row("", "", "[dim]Active cet onglet pour lancer la recherche (uv tool list)…[/dim]", "", "", "")
+
+    def _init_dups_placeholder(self) -> None:
+        t = self.query_one("#dups-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("Raison", "Outil", "Version", "Canonique", "Arborescence")
+        t.add_row("[dim]Active l'onglet packages pip/uv pour charger…[/dim]", "", "", "", "")
 
     # ── tab switching ────────────────────────────────────────────────────────
 
@@ -1607,7 +1628,7 @@ class AliasMenu(App):
             self.query_one("#func-table", DataTable).focus()
             n = sum(1 for e in getattr(self, "func_entries", []) if e["type"] != "section")
             self._status(f"{n} fonctions  ·  {FUNCTIONS_FILE}")
-        else:
+        elif active == "tab-tools":
             self.query_one("#tools-table", DataTable).focus()
             if not self._tools_loaded:
                 self._status("Recherche des outils installés via uv…")
@@ -1619,6 +1640,14 @@ class AliasMenu(App):
                 f"[m]/[M] structure interne du package sélectionné (texte/HTML)  ·  "
                 f"[g]/[G] dépendances ENTRE tous les packages (texte/HTML)"
             )
+        elif active == "tab-dups":
+            self.query_one("#dups-table", DataTable).focus()
+            if not self._tools_loaded:
+                self._status("Recherche des outils installés via uv…")
+                self._load_tools()
+                self._tools_loaded = True
+            n = len(self.dups_entries)
+            self._status(f"{n} doublon(s) filtré(s)  ·  [t] arbre du répertoire sélectionné")
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -1663,8 +1692,9 @@ class AliasMenu(App):
                 )
 
     def _load_tools(self) -> None:
-        self.tools_entries = parse_uv_tools()
+        self.tools_entries, self.dups_entries = parse_uv_tools()
         self._render_tools_table()
+        self._load_duplicates()
 
     _SOURCE_LABELS = {
         "uv-tool":      "Outils uv (uv tool install)",
@@ -1714,6 +1744,51 @@ class AliasMenu(App):
             )
             self._tool_rows.append(e)
 
+    # ── duplicates loader ────────────────────────────────────────────────────
+
+    _DUP_REASON_LABELS = {
+        "pip/uv": "pip non confirmé — version uv existe",
+        "copie":  "Copie (chemin plus profond)",
+    }
+
+    def _load_duplicates(self) -> None:
+        t = self.query_one("#dups-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("Raison", "Outil", "Version", "Canonique", "Arborescence")
+        self._dup_rows = []
+
+        by_reason: dict[str, list[dict]] = {}
+        for e in self.dups_entries:
+            by_reason.setdefault(e.get("_dup_reason", "?"), []).append(e)
+
+        for reason_key in ("pip/uv", "copie"):
+            group = by_reason.get(reason_key, [])
+            if not group:
+                continue
+            sec_label = self._DUP_REASON_LABELS.get(reason_key, reason_key)
+            t.add_row(
+                f"[bold bright_cyan]  ◆  {sec_label}[/bold bright_cyan]",
+                "[dim cyan]" + "─" * 38 + "[/dim cyan]",
+                "", "", "",
+                key=f"dsh{len(self._dup_rows)}",
+            )
+            self._dup_rows.append(None)
+            for e in group:
+                canon_name = os.path.basename(e.get("_dup_canonical", "")) or "—"
+                root = Path(e["tool_dir"])
+                tree_lines = render_dir_tree(root, max_depth=1, max_per_dir=10).splitlines()
+                tree_lines[0] = root.name + "/"
+                tree = "\n".join(tree_lines)
+                t.add_row(
+                    f"[dim]{sec_label}[/dim]",
+                    f"[bold yellow]{e['tool']}[/bold yellow]",
+                    f"[dim]{e.get('version') or '—'}[/dim]",
+                    f"[dim cyan]{canon_name}[/dim cyan]",
+                    f"[dim]{tree}[/dim]",
+                    key=f"d{len(self._dup_rows)}",
+                )
+                self._dup_rows.append(e)
+
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _status(self, msg: str) -> None:
@@ -1735,6 +1810,13 @@ class AliasMenu(App):
             if 0 <= row < len(entries):
                 e = entries[row]
                 return None if e["type"] == "section" else e
+            return None
+
+        if active == "tab-dups":
+            t = self.query_one("#dups-table", DataTable)
+            row = t.cursor_row
+            if 0 <= row < len(self._dup_rows):
+                return self._dup_rows[row]
             return None
 
         t = self.query_one("#tools-table", DataTable)
@@ -1856,7 +1938,7 @@ class AliasMenu(App):
     # ── action : vues de l'onglet Outils uv ─────────────────────────────────
 
     def action_toggle_view(self) -> None:
-        if self._active_tab() != "tab-tools" or not self._tools_loaded:
+        if self._active_tab() not in ("tab-tools", "tab-dups") or not self._tools_loaded:
             return
         entry = self._current()
         if not entry:
