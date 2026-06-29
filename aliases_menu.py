@@ -1845,7 +1845,14 @@ class AliasMenu(App):
             self._run_tool(entry)
 
     def _open_file_manager(self, path: str) -> None:
-        subprocess.Popen(["xdg-open", path])
+        # dolphin appelé directement (pas via xdg-open) : il détecte sa propre
+        # instance via D-Bus et ouvre dans la fenêtre existante plutôt qu'en créer
+        # une nouvelle. stdout/stderr → DEVNULL pour éviter les messages sur le TUI.
+        subprocess.Popen(
+            ["dolphin", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         self._status(f"Explorateur ouvert : {path}")
 
     def _run_alias(self, e: dict) -> None:
