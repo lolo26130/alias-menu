@@ -24,7 +24,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Label, Static, TabbedContent, TabPane
 
@@ -1449,15 +1449,40 @@ class DirTreeOverlay(ModalScreen):
         background: $panel;
         padding: 1 2;
     }
+    #tree-panel-pair {
+        width: 96%;
+        height: 85%;
+    }
+    .tree-pane {
+        width: 1fr;
+        height: 100%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+        margin: 0 1;
+    }
     #tree-title { text-style: bold; color: $accent; padding-bottom: 1; }
     """
 
-    def __init__(self, title: str, tree_text: str) -> None:
+    def __init__(self, title: str, tree_text: str,
+                 title2: str | None = None, tree_text2: str | None = None) -> None:
         super().__init__()
         self._title = title
         self._tree_text = tree_text
+        self._title2 = title2
+        self._tree_text2 = tree_text2
 
     def compose(self) -> ComposeResult:
+        if self._title2 is not None:
+            with Horizontal(id="tree-panel-pair"):
+                with VerticalScroll(classes="tree-pane"):
+                    yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
+                                 f"[dim]( t / Échap pour fermer )[/dim]", id="tree-title")
+                    yield Static(self._tree_text)
+                with VerticalScroll(classes="tree-pane"):
+                    yield Static(f"[bold bright_cyan]{self._title2}[/bold bright_cyan]")
+                    yield Static(self._tree_text2)
+            return
         with VerticalScroll(id="tree-panel"):
             yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
                          f"[dim]( t / Échap pour fermer )[/dim]", id="tree-title")
@@ -1720,7 +1745,10 @@ class AliasMenu(App):
                 self._load_tools()
                 self._tools_loaded = True
             n = len(self.dups_entries)
-            self._status(f"{n} doublon(s) filtré(s)  ·  [t] arbre du répertoire sélectionné")
+            self._status(
+                f"{n} doublon(s) filtré(s)  ·  "
+                f"[SPC] dolphin (vue scindée)  ·  [t] arbres comparés côte à côte"
+            )
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -1902,7 +1930,16 @@ class AliasMenu(App):
 
     def action_run_entry(self) -> None:
         active = self._active_tab()
-        if active in ("tab-tools", "tab-dups"):
+        if active == "tab-dups":
+            entry = self._current()
+            if entry:
+                canonical = entry.get("_dup_canonical")
+                if canonical and canonical != entry["tool_dir"]:
+                    self._open_file_manager_split(entry["tool_dir"], canonical)
+                else:
+                    self._open_file_manager(entry["tool_dir"])
+            return
+        if active == "tab-tools":
             entry = self._current()
             if entry:
                 self._open_file_manager(entry["tool_dir"])
@@ -1927,6 +1964,16 @@ class AliasMenu(App):
             stderr=subprocess.DEVNULL,
         )
         self._status(f"Explorateur ouvert : {_short_path(path)}")
+
+    def _open_file_manager_split(self, path_left: str, path_right: str) -> None:
+        # --split + --new-window : nouvelle fenêtre à deux volets (un par
+        # package), pour comparer visuellement le doublon et son canonique.
+        subprocess.Popen(
+            ["dolphin", "--split", "--new-window", path_left, path_right],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._status(f"Vue scindée : {_short_path(path_left)}  ↔  {_short_path(path_right)}")
 
     def _run_alias(self, e: dict) -> None:
         self._status(f"Lancement : {e['name']}  →  {e['cmd']}")
@@ -2028,7 +2075,8 @@ class AliasMenu(App):
     # ── action : vues de l'onglet Outils uv ─────────────────────────────────
 
     def action_toggle_view(self) -> None:
-        if self._active_tab() not in ("tab-tools", "tab-dups") or not self._tools_loaded:
+        active = self._active_tab()
+        if active not in ("tab-tools", "tab-dups") or not self._tools_loaded:
             return
         entry = self._current()
         if not entry:
@@ -2036,6 +2084,18 @@ class AliasMenu(App):
             return
         target_dir = Path(entry["tool_dir"])
         title = f"◆ {entry['tool']}  —  {_short_path(target_dir)}"
+
+        if active == "tab-dups":
+            canonical = entry.get("_dup_canonical")
+            if canonical and canonical != entry["tool_dir"]:
+                canon_dir = Path(canonical)
+                title2 = f"◆ {entry['tool']} (canonique)  —  {_short_path(canon_dir)}"
+                self.push_screen(DirTreeOverlay(
+                    title, render_dir_tree(target_dir),
+                    title2, render_dir_tree(canon_dir),
+                ))
+                return
+
         self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
 
     def action_toggle_detail(self) -> None:
