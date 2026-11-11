@@ -8,7 +8,7 @@ de chaque commande.
 
 ## Fonctionnalités
 
-- Onglets **Alias**, **Fonctions**, **packages pip/uv**, **Duplicates** et **opencode**
+- Onglets **Alias**, **Fonctions**, **packages pip/uv**, **Duplicates**, **opencode** et **Migration**
 - Sections visuelles regroupant les commandes (détectées automatiquement à partir
   des blocs `#===...===` dans les fichiers source)
 - `Space` : lance l'alias / la fonction sélectionnée
@@ -30,6 +30,27 @@ de chaque commande.
 - `t` : arbre du répertoire de la session.
 - `x` : supprime la session après confirmation.
 - `Ctrl+→` / `Ctrl+←` : change d'onglet (clic souris aussi possible)
+
+### Onglet Migration
+
+- Liste la portée globale (`~/.claude` → `~/.config/opencode`) et chaque projet
+  connu d'OpenCode, avec le nombre d'éléments Claude/OpenCode et un état
+  (`à convertir`, `mixte`, `OpenCode seul`, `vide`).
+- `C` : convertit la portée sélectionnée de Claude Code vers OpenCode.
+  - aperçu détaillé avant écriture, validation par `y` / `Entrée` ;
+  - sauvegarde complète dans `.claude-backup/<date>/` (sources + cibles
+    existantes) et rapport `CONVERSION_REPORT.md` ;
+  - les originaux Claude ne sont jamais modifiés.
+- `A` : audit de bonnes pratiques avec score et actions prioritaires
+  (AGENTS.md, tests, README, pyproject, lockfile, lint, CI, secrets, etc.).
+- `s` : affiche le dernier rapport de conversion.
+- `d` / `t` : documents Claude/OpenCode et arbre du projet.
+- `r` : rescanne la liste.
+
+La conversion couvre `CLAUDE.md`, `CLAUDE.local.md`, les permissions de
+`.claude/settings*.json`, les commandes, agents, skills, règles, MCP, et
+conserve les éléments non convertis (hooks, env, modèles Claude…) dans les
+avertissements et la sauvegarde.
 
 ## Installation / usage
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=0.40.0"]
+# dependencies = ["textual>=0.40.0", "json5>=0.9", "pyyaml>=6"]
 # ///
 """
 Alias & Functions Browser — menu TUI style DietPi
@@ -10,6 +10,7 @@ Lancement : uv run ~/scripts/aliases_menu.py   ou   am
 
 import ast
 import configparser
+import fnmatch
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
+import json5
+import yaml
 from rich.markup import escape
 
 from textual.app import App, ComposeResult
@@ -37,6 +40,8 @@ FUNCTIONS_FILE = Path.home() / ".bash_functions"
 UV_TOOLS_DIR   = Path.home() / ".local" / "share" / "uv" / "tools"
 OPENCODE_BIN   = shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
 OPENCODE_CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "opencode"
+CLAUDE_CONFIG_DIR   = Path.home() / ".claude"
+CLAUDE_GLOBAL_JSON  = Path.home() / ".claude.json"
 # Arborescences scannées pour trouver des projets gérés par uv (pyproject.toml + uv.lock).
 # Ajoute d'autres répertoires ici si besoin.
 UV_PROJECT_DIRS = [Path.home() / "Documents" / "Python", 
@@ -99,7 +104,7 @@ _TOOL_HEADER_RE = re.compile(r"^(\S+)\s+v(\S+)\s+\[(.*?)\]\s+\((.*?)\)$")
 _TOOL_ENTRY_RE  = re.compile(r"^-\s+(\S+)\s+\((.*?)\)$")
 _SITE_PKG_NOISE = {"__pycache__", "_virtualenv.py", "_virtualenv.pth"}
 
-TAB_IDS = ["tab-alias", "tab-func", "tab-tools", "tab-dups", "tab-opencode"]
+TAB_IDS = ["tab-alias", "tab-func", "tab-tools", "tab-dups", "tab-opencode", "tab-migration"]
 
 
 # ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -1222,6 +1227,1593 @@ def format_opencode_docs(directory: Path, *, instructions: bool = True,
     return _format_files(items, empty)
 
 
+# ─── Migration Claude Code → OpenCode & audit ──────────────────────────────────
+
+_CONVERSION_SKIP_PARTS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".claude-backup",
+}
+_CLAUDE_TOOL_ACTIONS = {
+    "Read": "read",
+    "Glob": "glob",
+    "Grep": "grep",
+    "Edit": "edit",
+    "Write": "edit",
+    "NotebookEdit": "edit",
+    "Bash": "shell",
+    "PowerShell": "shell",
+    "WebFetch": "webfetch",
+    "WebSearch": "websearch",
+    "Agent": "subagent",
+    "Task": "subagent",
+    "Skill": "skill",
+}
+
+
+class ConversionPlan:
+    """Plan de conversion Claude Code → OpenCode, calculé avant toute écriture."""
+
+    def __init__(self, scope: Path, is_global: bool = False) -> None:
+        self.scope = scope
+        self.is_global = is_global
+        self.sources: list[Path] = []
+        self.writes: list[dict] = []       # {"path", "content", "label"}
+        self.copies: list[dict] = []       # {"src", "dst", "label"}
+        self.warnings: list[str] = []
+        self.notes: list[str] = []
+        self.config_target: Path | None = None
+        self.config_patch: dict = {}
+        self.instructions: list[tuple[Path, str]] = []
+        self.extra_backups: list[tuple[str, str]] = []
+        self.mcp_disabled: set[str] = set()
+        self.mcp_enabled: set[str] | None = None
+        self.backup_root = (OPENCODE_CONFIG_DIR if is_global else scope) / ".claude-backup"
+
+    def add_source(self, path: Path) -> None:
+        if path.is_file() or path.is_dir():
+            self.sources.append(path)
+
+    def add_write(self, path: Path, content: str, label: str) -> None:
+        self.writes.append({"path": path, "content": content, "label": label})
+
+    def add_copy(self, src: Path, dst: Path, label: str) -> None:
+        self.copies.append({"src": src, "dst": dst, "label": label})
+
+    def warn(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    def note(self, message: str) -> None:
+        if message not in self.notes:
+            self.notes.append(message)
+
+    def has_changes(self) -> bool:
+        return bool(self.writes or self.copies or self.config_patch or self.instructions)
+
+
+def _now_label() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_jsonc(path: Path) -> dict | None:
+    try:
+        data = json5.loads(path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_json_file(path: Path, data: dict, generated: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    if path.suffix == ".jsonc" and generated:
+        body = (
+            f"// Fusionné par aliases_menu (import Claude Code) le {_now_label()}\n"
+            "// L'original complet est conservé dans .claude-backup/.\n"
+            + body
+        )
+    path.write_text(body)
+
+
+def _generated_text(text: str) -> bool:
+    return "aliases_menu:generated" in text
+
+
+def _can_write_target(plan: ConversionPlan, target: Path) -> bool:
+    if target.is_symlink():
+        plan.warn(f"Cible symbolique, ignorée : {_tilde(target)}")
+        return False
+    if not target.exists():
+        return True
+    if _generated_text(_read_text(target)):
+        return True
+    plan.warn(f"Cible existante non générée, ignorée : {_tilde(target)}")
+    return False
+
+
+def _add_write_if_changed(plan: ConversionPlan, target: Path,
+                          content: str, label: str) -> None:
+    if target.exists() and _read_text(target) == content:
+        return
+    plan.add_write(target, content, label)
+
+
+def _split_frontmatter(text: str) -> tuple[dict, str]:
+    """Retourne (frontmatter YAML, corps Markdown)."""
+    clean = text.lstrip("\ufeff")
+    lines = clean.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, clean
+    end = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() in ("---", "..."):
+            end = index
+            break
+    if end is None:
+        return {}, clean
+    raw = "\n".join(lines[1:end])
+    try:
+        frontmatter = yaml.safe_load(raw) or {}
+    except yaml.YAMLError:
+        return {}, clean
+    if not isinstance(frontmatter, dict):
+        frontmatter = {}
+    body = "\n".join(lines[end + 1:]).lstrip("\n")
+    return frontmatter, body
+
+
+def _render_markdown(frontmatter: dict, body: str, generated_from: str | None = None) -> str:
+    lines = ["---"]
+    if generated_from:
+        lines.append(f"# aliases_menu:generated from {generated_from}")
+    if frontmatter:
+        dumped = yaml.safe_dump(
+            frontmatter, allow_unicode=True, sort_keys=False, width=120,
+        ).rstrip()
+        lines.extend(dumped.splitlines())
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines) + body.rstrip() + "\n"
+
+
+def _extract_import_paths(text: str, base: Path) -> list[Path]:
+    """Chemins référencés par la syntaxe Claude `@chemin` (hors code inline/blocs)."""
+    without_fences = re.sub(r"```.*?```", "", text, flags=re.S)
+    imports: list[Path] = []
+    seen: set[Path] = set()
+    for line in without_fences.splitlines():
+        line = re.sub(r"`[^`]*`", "", line)
+        for match in re.findall(r"(?<![`\w])@([^\s`]+)", line):
+            raw = match.rstrip(".,;:!?)]}\"'")
+            if not raw or raw.startswith("@"):
+                continue
+            candidate = Path(os.path.expanduser(raw))
+            if not candidate.is_absolute():
+                candidate = base / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            if resolved.is_file() and resolved not in seen:
+                seen.add(resolved)
+                imports.append(resolved)
+    return imports
+
+
+def _config_string(plan: ConversionPlan, path: Path) -> str:
+    if plan.is_global:
+        return _tilde(path)
+    try:
+        return str(path.relative_to(plan.scope)).replace(os.sep, "/")
+    except ValueError:
+        return _tilde(path)
+
+
+def _opencode_config_target(plan: ConversionPlan) -> Path:
+    if plan.is_global:
+        candidates = [
+            OPENCODE_CONFIG_DIR / "opencode.json",
+            OPENCODE_CONFIG_DIR / "opencode.jsonc",
+        ]
+    else:
+        candidates = [
+            plan.scope / "opencode.json",
+            plan.scope / "opencode.jsonc",
+            plan.scope / ".opencode" / "opencode.json",
+            plan.scope / ".opencode" / "opencode.jsonc",
+        ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _plan_instructions(plan: ConversionPlan) -> None:
+    target = (OPENCODE_CONFIG_DIR if plan.is_global else plan.scope) / "AGENTS.md"
+    target_is_symlink = target.is_symlink()
+    if target_is_symlink:
+        plan.warn(
+            f"AGENTS.md est un lien symbolique ({_tilde(target)}) ; "
+            "l'écriture est annulée pour ne pas modifier le fichier cible."
+        )
+    sources: list[tuple[Path, str]] = []
+    if plan.is_global:
+        candidate = CLAUDE_CONFIG_DIR / "CLAUDE.md"
+        if candidate.is_file():
+            sources.append((candidate, "~/.claude/CLAUDE.md"))
+    else:
+        for name in ("CLAUDE.md", ".claude/CLAUDE.md"):
+            candidate = plan.scope / name
+            if candidate.is_file():
+                sources.append((candidate, name))
+
+    sections: list[str] = []
+    existing_text = _read_text(target)
+    for source, label in sources:
+        plan.add_source(source)
+        text = _read_text(source)
+        for imported in _extract_import_paths(text, source.parent):
+            plan.add_source(imported)
+            plan.instructions.append((imported, _config_string(plan, imported)))
+        converted = re.sub(r"\bCLAUDE\.md\b", "AGENTS.md", text)
+        converted = re.sub(r"\bClaude Code\b", "OpenCode", converted)
+        stripped = converted.strip()
+        if not stripped or stripped in existing_text:
+            continue
+        section = converted.rstrip()
+        if len(sources) > 1 or target.exists():
+            section = f"## Importé de {label} ({_now_label()})\n\n{section}"
+        sections.append(section)
+        existing_text += "\n\n" + section
+    if sources:
+        plan.note("Références CLAUDE.md → AGENTS.md et Claude Code → OpenCode.")
+
+    if sections and not target_is_symlink:
+        existing = _read_text(target).rstrip()
+        merged = (existing + "\n\n" if existing else "") + "\n\n".join(sections) + "\n"
+        plan.add_write(target, merged, "AGENTS.md (instructions)")
+
+    local = plan.scope / "CLAUDE.local.md"
+    if not plan.is_global and local.is_file():
+        plan.add_source(local)
+        local_target = plan.scope / ".opencode" / "instructions" / "claude-local.md"
+        if _can_write_target(plan, local_target):
+            content = (
+                "<!-- aliases_menu:generated from CLAUDE.local.md -->\n\n"
+                + _read_text(local).rstrip() + "\n"
+            )
+            _add_write_if_changed(plan, local_target, content, "instructions locales Claude")
+            plan.instructions.append((local_target, _config_string(plan, local_target)))
+        plan.warn(
+            "CLAUDE.local.md copié dans .opencode/instructions/ et chargé via instructions : "
+            "fichier personnel, vérifie qu'il n'est pas commité."
+        )
+
+
+def _claude_permission_rule(rule: str, effect: str, plan: ConversionPlan,
+                            label: str) -> dict | None:
+    raw = rule.strip()
+    match = re.match(r"^([A-Za-z_][\w-]*)(?:\((.*)\))?$", raw)
+    if not match:
+        plan.warn(f"Règle de permission non reconnue ({label}) : {raw}")
+        return None
+    tool, specifier = match.group(1), (match.group(2) or "").strip()
+
+    action = _CLAUDE_TOOL_ACTIONS.get(tool)
+    resource = "*"
+    if tool.startswith("mcp__"):
+        parts = tool.split("__")
+        server = re.sub(r"[^A-Za-z0-9_-]+", "_", parts[1] if len(parts) > 1 else "")
+        rest = "__".join(parts[2:]) if len(parts) > 2 else "*"
+        rest_norm = re.sub(r"[^A-Za-z0-9_-]+", "_", rest)
+        action = f"{server}_{rest_norm}"
+    if action is None:
+        plan.warn(f"Outil Claude non converti ({label}) : {raw}")
+        return None
+
+    if specifier and not tool.startswith("mcp__"):
+        if action == "shell":
+            specifier = re.sub(r"^command:", "", specifier)
+            if specifier.endswith(":*"):
+                specifier = specifier[:-2] + " *"
+        elif action in ("read", "edit"):
+            if specifier.startswith("//"):
+                specifier = specifier[1:]
+            elif specifier.startswith("./"):
+                specifier = specifier[2:]
+        elif action == "webfetch" and specifier.startswith("domain:"):
+            specifier = f"*{specifier[7:]}*"
+        resource = specifier or "*"
+
+    return {"action": action, "resource": resource, "effect": effect}
+
+
+def _plan_settings(plan: ConversionPlan) -> None:
+    if plan.is_global:
+        settings_files = [(CLAUDE_CONFIG_DIR / "settings.json", "~/.claude/settings.json")]
+    else:
+        settings_files = [
+            (plan.scope / ".claude" / "settings.json", ".claude/settings.json"),
+            (plan.scope / ".claude" / "settings.local.json", ".claude/settings.local.json"),
+        ]
+
+    permissions: list[dict] = []
+    hooks: dict = {}
+    env_keys: list[str] = []
+    default_mode: str | None = None
+    unmapped: dict[str, object] = {}
+
+    for path, label in settings_files:
+        if not path.is_file():
+            continue
+        plan.add_source(path)
+        data = _read_jsonc(path)
+        if data is None:
+            plan.warn(f"JSON invalide, fichier ignoré : {_tilde(path)}")
+            continue
+
+        block = data.get("permissions")
+        if isinstance(block, dict):
+            for effect in ("allow", "ask", "deny"):
+                for rule in block.get(effect) or []:
+                    converted = _claude_permission_rule(str(rule), effect, plan, label)
+                    if converted:
+                        permissions.append(converted)
+            for directory in block.get("additionalDirectories") or []:
+                directory_path = Path(os.path.expanduser(str(directory)))
+                if not directory_path.is_absolute():
+                    directory_path = plan.scope / directory_path
+                try:
+                    directory_path = directory_path.resolve()
+                except OSError:
+                    pass
+                permissions.append({
+                    "action": "external_directory",
+                    "resource": str(directory_path).rstrip("/") + "/*",
+                    "effect": "allow",
+                })
+            default_mode = block.get("defaultMode") or default_mode
+            if block.get("blockReadsOutsideWorkingDirectories"):
+                plan.warn(
+                    "permissions.blockReadsOutsideWorkingDirectories non converti : "
+                    "utiliser external_directory: deny (bloque aussi les écritures)."
+                )
+            if block.get("blockWritesOutsideWorkingDirectories"):
+                plan.warn("permissions.blockWritesOutsideWorkingDirectories non converti.")
+
+        if isinstance(data.get("hooks"), dict):
+            for event, entries in data["hooks"].items():
+                hooks.setdefault(event, []).extend(entries or [])
+
+        if isinstance(data.get("env"), dict):
+            env_keys.extend(data["env"].keys())
+        if isinstance(data.get("disabledMcpjsonServers"), list):
+            plan.mcp_disabled.update(str(name) for name in data["disabledMcpjsonServers"])
+        if isinstance(data.get("enabledMcpjsonServers"), list):
+            plan.mcp_enabled = {str(name) for name in data["enabledMcpjsonServers"]}
+
+        for key in (
+            "model", "fallbackModel", "statusLine", "outputStyle", "theme",
+            "spinnerTipsEnabled", "alwaysThinkingEnabled", "autoUpdates",
+            "includeCoAuthoredBy", "cleanupPeriodDays", "apiKeyHelper",
+            "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper",
+            "forceLoginMethod", "forceLoginOrgUUID", "enabledPlugins",
+            "extraKnownMarketplaces", "enableAllProjectMcpServers",
+            "autoMemoryEnabled", "autoMemoryDirectory", "claudeMdExcludes",
+        ):
+            if key in data:
+                unmapped[key] = data[key]
+
+    if permissions:
+        plan.config_patch.setdefault("permissions", []).extend(permissions)
+    if default_mode:
+        if default_mode in ("acceptEdits",):
+            plan.note("defaultMode=acceptEdits : OpenCode autorise déjà les edits par défaut.")
+        elif default_mode in ("bypassPermissions", "dontAsk"):
+            plan.note(
+                f"defaultMode={default_mode} : OpenCode autorise déjà les actions par défaut "
+                "(aucune règle ajoutée)."
+            )
+        elif default_mode == "plan":
+            plan.warn(
+                "defaultMode=plan non convertible en configuration : "
+                "utiliser l'agent `plan` d'OpenCode pour une session en lecture seule."
+            )
+        else:
+            plan.note(f"defaultMode={default_mode} : comportement par défaut d'OpenCode.")
+    if hooks:
+        plan.warn(
+            "Hooks Claude non convertis automatiquement (aucun équivalent direct) : "
+            + ", ".join(sorted(hooks)) + ". L'original est conservé dans la sauvegarde."
+        )
+    if env_keys:
+        plan.warn(
+            "Variables env non converties (valeurs conservées dans la sauvegarde) : "
+            + ", ".join(sorted(set(env_keys))) + "."
+        )
+    if unmapped:
+        plan.warn(
+            "Réglages Claude sans équivalent OpenCode, conservés dans la sauvegarde : "
+            + ", ".join(sorted(unmapped)) + "."
+        )
+
+
+def _iter_claude_markdown(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    files: list[Path] = []
+    for path in sorted(root.rglob("*.md")):
+        if not path.is_file():
+            continue
+        parts = path.relative_to(root).parts
+        if any(
+            part in _CONVERSION_SKIP_PARTS or part.startswith(".")
+            for part in parts
+        ):
+            continue
+        files.append(path)
+    return files
+
+
+def _plan_commands(plan: ConversionPlan) -> None:
+    source_root = CLAUDE_CONFIG_DIR / "commands" if plan.is_global else plan.scope / ".claude" / "commands"
+    target_root = (
+        OPENCODE_CONFIG_DIR / "commands" if plan.is_global
+        else plan.scope / ".opencode" / "commands"
+    )
+    for source in _iter_claude_markdown(source_root):
+        plan.add_source(source)
+        frontmatter, body = _split_frontmatter(_read_text(source))
+        target = target_root / source.relative_to(source_root)
+        if not _can_write_target(plan, target):
+            continue
+
+        converted: dict = {}
+        if frontmatter.get("description"):
+            converted["description"] = frontmatter["description"]
+        if frontmatter.get("agent"):
+            converted["agent"] = frontmatter["agent"]
+        model = frontmatter.get("model")
+        if isinstance(model, str) and "/" in model:
+            converted["model"] = model
+        elif model:
+            plan.warn(
+                f"Modèle Claude non converti dans {source.name} : {model} "
+                "(OpenCode attend provider/modèle)."
+            )
+        if frontmatter.get("context") == "fork":
+            converted["subagent"] = True
+            if frontmatter.get("background") is False:
+                plan.warn(
+                    f"{source.name} : `context: fork` + `background: false` non représentable ; "
+                    "converti en subagent OpenCode."
+                )
+        unsupported = [
+            key for key in (
+                "argument-hint", "allowed-tools", "disallowed-tools",
+                "disable-model-invocation", "user-invocable", "when_to_use",
+                "arguments", "effort", "hooks", "paths", "shell",
+            ) if frontmatter.get(key) is not None
+        ]
+        if unsupported:
+            plan.warn(
+                f"Champs de commande non convertis dans {source.name} : "
+                + ", ".join(unsupported) + "."
+            )
+        rel = source.relative_to(source_root)
+        _add_write_if_changed(
+            plan, target,
+            _render_markdown(converted, body, f"{source}"),
+            f"commande /{rel.with_suffix('').as_posix()}",
+        )
+
+
+def _tool_entries(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not isinstance(value, str):
+        return []
+    value = value.strip()
+    if not value:
+        return []
+    if "," in value:
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if "(" in value:
+        return [value]
+    return [part for part in value.split() if part]
+
+
+def _agent_permissions(agent: dict, plan: ConversionPlan, label: str) -> list[dict]:
+    rules: list[dict] = []
+    tools = _tool_entries(agent.get("tools"))
+    disallowed = _tool_entries(agent.get("disallowedTools"))
+
+    if tools:
+        rules.append({"action": "*", "resource": "*", "effect": "deny"})
+        for entry in tools:
+            converted = _claude_permission_rule(entry, "allow", plan, label)
+            if converted:
+                rules.append(converted)
+    for entry in disallowed:
+        converted = _claude_permission_rule(entry, "deny", plan, label)
+        if converted:
+            rules.append(converted)
+
+    mode = agent.get("permissionMode")
+    if mode == "plan":
+        rules.append({"action": "edit", "resource": "*", "effect": "deny"})
+    elif mode in ("bypassPermissions", "dontAsk", "acceptEdits"):
+        plan.note(f"{label} : permissionMode={mode} (OpenCode autorise par défaut).")
+    elif mode and mode not in ("default", "auto", "manual"):
+        plan.warn(f"{label} : permissionMode={mode} non converti.")
+    return rules
+
+
+def _plan_agents(plan: ConversionPlan) -> None:
+    source_root = CLAUDE_CONFIG_DIR / "agents" if plan.is_global else plan.scope / ".claude" / "agents"
+    target_root = (
+        OPENCODE_CONFIG_DIR / "agents" if plan.is_global
+        else plan.scope / ".opencode" / "agents"
+    )
+    for source in _iter_claude_markdown(source_root):
+        plan.add_source(source)
+        frontmatter, body = _split_frontmatter(_read_text(source))
+        if not frontmatter.get("name") and not frontmatter.get("description"):
+            plan.warn(
+                f"Fichier d'agent ignoré (ni name ni description) : {_tilde(source)}"
+            )
+            continue
+        name = str(frontmatter.get("name") or source.stem)
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or source.stem
+        target = target_root / f"{name}.md"
+        if not _can_write_target(plan, target):
+            continue
+
+        converted: dict = {
+            "description": frontmatter.get("description") or f"Agent importé de Claude Code ({name})",
+            "mode": "subagent",
+        }
+        model = frontmatter.get("model")
+        if isinstance(model, str) and "/" in model:
+            converted["model"] = model
+        elif model and model not in ("inherit",):
+            plan.warn(
+                f"Modèle Claude non converti dans l'agent {name} : {model} "
+                "(OpenCode attend provider/modèle)."
+            )
+        permissions = _agent_permissions(frontmatter, plan, f"agent {name}")
+        if permissions:
+            converted["permissions"] = permissions
+        if isinstance(frontmatter.get("maxTurns"), int) and frontmatter["maxTurns"] > 0:
+            converted["steps"] = frontmatter["maxTurns"]
+
+        unsupported = [
+            key for key in (
+                "skills", "mcpServers", "hooks", "memory", "background",
+                "omitClaudeMd", "effort", "isolation", "color", "initialPrompt",
+                "experimental", "autoCompactWindow", "permissionMode",
+            ) if frontmatter.get(key) is not None
+        ]
+        if unsupported:
+            plan.warn(
+                f"Champs d'agent non convertis dans {source.name} : "
+                + ", ".join(unsupported) + "."
+            )
+        _add_write_if_changed(
+            plan, target,
+            _render_markdown(converted, body, f"{source}"),
+            f"agent {name}",
+        )
+
+
+def _plan_skills(plan: ConversionPlan) -> None:
+    source_root = CLAUDE_CONFIG_DIR / "skills" if plan.is_global else plan.scope / ".claude" / "skills"
+    target_root = (
+        OPENCODE_CONFIG_DIR / "skills" if plan.is_global
+        else plan.scope / ".opencode" / "skills"
+    )
+    if not source_root.is_dir():
+        return
+
+    skill_files: list[Path] = []
+    skipped = 0
+    for path in sorted(source_root.rglob("SKILL.md")):
+        if not path.is_file():
+            continue
+        parts = path.relative_to(source_root).parts
+        if any(part in _CONVERSION_SKIP_PARTS or part.startswith(".") for part in parts):
+            skipped += 1
+            continue
+        if any(part in (".trash", "synced") for part in parts):
+            skipped += 1
+            continue
+        skill_files.append(path)
+    for path in sorted(source_root.glob("*.md")):
+        if path.is_file() and path.name != "SKILL.md":
+            skill_files.append(path)
+    if skipped:
+        plan.warn(
+            f"{skipped} skill(s) ignoré(s) : dossiers cachés, corbeille ou skills synchronisés "
+            "gérés par Claude Code."
+        )
+
+    seen: set[Path] = set()
+    for source in skill_files:
+        if source in seen:
+            continue
+        seen.add(source)
+        plan.add_source(source)
+        if source.name == "SKILL.md":
+            source_dir = source.parent
+            skill_id = source_dir.name
+        else:
+            source_dir = None
+            skill_id = source.stem
+        skill_id = re.sub(r"[^A-Za-z0-9._-]+", "-", skill_id).strip("-") or "skill"
+        target_dir = target_root / skill_id
+        target = target_dir / "SKILL.md"
+        if not _can_write_target(plan, target):
+            continue
+
+        frontmatter, body = _split_frontmatter(_read_text(source))
+        converted: dict = {
+            "name": frontmatter.get("name") or skill_id,
+            "description": frontmatter.get("description") or "",
+        }
+        if not converted["description"]:
+            first_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+            converted["description"] = first_line[:200] or f"Skill importé de Claude Code ({skill_id})"
+        metadata = dict(frontmatter.get("metadata") or {})
+        if frontmatter.get("disable-model-invocation") is True:
+            metadata["opencode/autoinvoke"] = False
+        if metadata:
+            converted["metadata"] = metadata
+        if frontmatter.get("license"):
+            converted["license"] = frontmatter["license"]
+        if frontmatter.get("compatibility"):
+            converted["compatibility"] = frontmatter["compatibility"]
+
+        unsupported = [
+            key for key in (
+                "when_to_use", "argument-hint", "arguments", "allowed-tools",
+                "disallowed-tools", "model", "effort", "context", "agent",
+                "background", "hooks", "paths", "shell", "user-invocable",
+            ) if frontmatter.get(key) is not None
+        ]
+        if unsupported:
+            plan.warn(
+                f"Champs de skill non convertis dans {source} : "
+                + ", ".join(unsupported) + "."
+            )
+        _add_write_if_changed(
+            plan, target,
+            _render_markdown(converted, body, f"{source}"),
+            f"skill {skill_id}",
+        )
+        if source_dir is not None:
+            for child in sorted(source_dir.iterdir()):
+                if child.name in ("SKILL.md",) or child.name.startswith("."):
+                    continue
+                dst = target_dir / child.name
+                if dst.exists():
+                    continue
+                plan.add_copy(child, dst, f"skill {skill_id}/{child.name}")
+
+
+def _plan_rules(plan: ConversionPlan) -> None:
+    source_root = CLAUDE_CONFIG_DIR / "rules" if plan.is_global else plan.scope / ".claude" / "rules"
+    target_root = (
+        OPENCODE_CONFIG_DIR / "instructions" / "claude-rules" if plan.is_global
+        else plan.scope / ".opencode" / "instructions" / "claude-rules"
+    )
+    for source in _iter_claude_markdown(source_root):
+        plan.add_source(source)
+        target = target_root / source.relative_to(source_root)
+        if not _can_write_target(plan, target):
+            continue
+        content = (
+            "<!-- aliases_menu:generated from "
+            f"{source} — frontmatter `paths` conservé mais non appliqué par OpenCode -->\n\n"
+            + _read_text(source).rstrip() + "\n"
+        )
+        _add_write_if_changed(plan, target, content, f"règle {source.name}")
+        plan.instructions.append((target, _config_string(plan, target)))
+        if "paths:" in _read_text(source):
+            plan.warn(
+                f"Règle {source.name} : la portée `paths` de Claude n'est pas appliquée par "
+                "OpenCode ; la règle sera chargée pour tout le projet."
+            )
+
+
+def _convert_mcp_server(name: str, config: dict, plan: ConversionPlan) -> dict | None:
+    server_type = str(config.get("type") or "stdio").lower()
+    if server_type in ("stdio", "local"):
+        command = config.get("command")
+        if not command:
+            plan.warn(f"Serveur MCP {name} ignoré : commande absente.")
+            return None
+        args = [str(arg) for arg in (config.get("args") or [])]
+        converted: dict = {
+            "type": "local",
+            "command": [str(command), *args],
+        }
+        environment = config.get("env") or config.get("environment")
+        if isinstance(environment, dict) and environment:
+            converted["environment"] = {str(k): str(v) for k, v in environment.items()}
+        if config.get("cwd"):
+            converted["cwd"] = config["cwd"]
+        if config.get("disabled"):
+            converted["disabled"] = True
+    elif server_type in ("http", "sse", "remote", "ws"):
+        url = config.get("url")
+        if not url:
+            plan.warn(f"Serveur MCP {name} ignoré : URL absente.")
+            return None
+        converted = {"type": "remote", "url": url}
+        headers = config.get("headers")
+        if isinstance(headers, dict) and headers:
+            converted["headers"] = {str(k): str(v) for k, v in headers.items()}
+        if config.get("disabled"):
+            converted["disabled"] = True
+        if server_type in ("sse", "ws"):
+            plan.warn(
+                f"Serveur MCP {name} de type {server_type} converti en remote HTTP ; "
+                "vérifier la compatibilité du transport."
+            )
+    else:
+        plan.warn(f"Serveur MCP {name} ignoré : type inconnu ({server_type}).")
+        return None
+
+    ignored = set(config) - {
+        "type", "command", "args", "env", "environment", "cwd", "url",
+        "headers", "disabled", "alwaysAllow",
+    }
+    if ignored:
+        plan.warn(
+            f"Serveur MCP {name} : champs non convertis : " + ", ".join(sorted(ignored)) + "."
+        )
+    return converted
+
+
+def _apply_mcp_state(plan: ConversionPlan, name: str, converted: dict) -> None:
+    if name in plan.mcp_disabled:
+        converted["disabled"] = True
+        plan.note(f"MCP {name} désactivé (disabledMcpjsonServers).")
+    elif plan.mcp_enabled is not None and name not in plan.mcp_enabled:
+        converted["disabled"] = True
+        plan.note(f"MCP {name} désactivé (enabledMcpjsonServers ne le liste pas).")
+
+
+def _plan_mcp(plan: ConversionPlan) -> None:
+    sources: list[Path] = []
+    if plan.is_global:
+        if CLAUDE_GLOBAL_JSON.is_file():
+            data = _read_jsonc(CLAUDE_GLOBAL_JSON)
+            if data is None:
+                plan.warn(f"{_tilde(CLAUDE_GLOBAL_JSON)} illisible ; MCP global non converti.")
+            else:
+                servers = data.get("mcpServers") or {}
+                if isinstance(servers, dict):
+                    plan.extra_backups.append((
+                        "claude.json.mcpServers.json",
+                        json.dumps({"mcpServers": servers}, indent=2, ensure_ascii=False),
+                    ))
+                    target = _opencode_config_target(plan)
+                    existing = _read_jsonc(target) if target.is_file() else {}
+                    mcp_cfg = existing.get("mcp") if isinstance(existing, dict) else {}
+                    existing_servers = mcp_cfg.get("servers") if isinstance(mcp_cfg, dict) else {}
+                    if not isinstance(existing_servers, dict):
+                        existing_servers = {}
+                    for name, config in servers.items():
+                        if not isinstance(config, dict):
+                            continue
+                        if name in existing_servers:
+                            plan.warn(
+                                f"Serveur MCP global {name} déjà configuré dans OpenCode ; ignoré."
+                            )
+                            continue
+                        converted = _convert_mcp_server(name, config, plan)
+                        if converted:
+                            _apply_mcp_state(plan, name, converted)
+                            plan.config_patch.setdefault("mcp", {}).setdefault(
+                                "servers", {}
+                            )[name] = converted
+                        plan.note(f"MCP global importé : {name}.")
+    else:
+        mcp_file = plan.scope / ".mcp.json"
+        if mcp_file.is_file():
+            sources.append(mcp_file)
+    for source in sources:
+        plan.add_source(source)
+        data = _read_jsonc(source)
+        if data is None:
+            plan.warn(f"{_tilde(source)} illisible ; MCP non converti.")
+            continue
+        servers = data.get("mcpServers") or {}
+        if not isinstance(servers, dict):
+            continue
+        target = _opencode_config_target(plan)
+        existing = _read_jsonc(target) if target.is_file() else {}
+        mcp_cfg = existing.get("mcp") if isinstance(existing, dict) else {}
+        existing_servers = mcp_cfg.get("servers") if isinstance(mcp_cfg, dict) else {}
+        if not isinstance(existing_servers, dict):
+            existing_servers = {}
+        for name, config in servers.items():
+            if not isinstance(config, dict):
+                continue
+            if name in existing_servers:
+                plan.warn(f"Serveur MCP {name} déjà configuré dans OpenCode ; ignoré.")
+                continue
+            converted = _convert_mcp_server(name, config, plan)
+            if converted:
+                _apply_mcp_state(plan, name, converted)
+                plan.config_patch.setdefault("mcp", {}).setdefault("servers", {})[name] = converted
+
+
+def build_claude_conversion_plan(scope: Path, is_global: bool = False) -> ConversionPlan:
+    plan = ConversionPlan(scope, is_global)
+    _plan_instructions(plan)
+    _plan_settings(plan)
+    _plan_commands(plan)
+    _plan_agents(plan)
+    _plan_skills(plan)
+    _plan_rules(plan)
+    _plan_mcp(plan)
+
+    if plan.config_patch or plan.instructions:
+        target = _opencode_config_target(plan)
+        if target.is_symlink():
+            plan.warn(
+                f"Configuration OpenCode est un lien symbolique ({_tilde(target)}) ; "
+                "fusion annulée pour préserver le fichier cible."
+            )
+        elif target.is_file() and _read_jsonc(target) is None:
+            plan.warn(
+                f"Configuration OpenCode illisible/invalide : {_tilde(target)}. "
+                "Elle ne sera pas fusionnée."
+            )
+        else:
+            existing = _read_jsonc(target) if target.is_file() else {}
+            existing = existing or {}
+
+            existing_rules = existing.get("permissions")
+            if not isinstance(existing_rules, list):
+                existing_rules = []
+            rules = [
+                rule for rule in (plan.config_patch.get("permissions") or [])
+                if rule not in existing_rules
+            ]
+            if rules:
+                plan.config_patch["permissions"] = rules
+            else:
+                plan.config_patch.pop("permissions", None)
+
+            mcp_patch = plan.config_patch.get("mcp") or {}
+            servers = mcp_patch.get("servers") or {}
+            existing_mcp = existing.get("mcp") if isinstance(existing.get("mcp"), dict) else {}
+            existing_servers = (
+                existing_mcp.get("servers")
+                if isinstance(existing_mcp.get("servers"), dict) else {}
+            )
+            for name in list(servers):
+                if name in existing_servers:
+                    plan.warn(f"Serveur MCP {name} déjà présent dans OpenCode ; ignoré.")
+                    del servers[name]
+            if not servers:
+                plan.config_patch.pop("mcp", None)
+
+            existing_instructions = existing.get("instructions")
+            if not isinstance(existing_instructions, list):
+                existing_instructions = []
+            plan.instructions = [
+                entry for entry in plan.instructions
+                if entry[1] not in existing_instructions
+            ]
+            if plan.config_patch or plan.instructions:
+                plan.config_target = target
+            else:
+                plan.config_target = None
+    return plan
+
+
+def _plan_summary(plan: ConversionPlan, actionable: bool = True) -> str:
+    scope_label = "Global (~/.claude)" if plan.is_global else str(plan.scope)
+    lines = [
+        f"Portée      : {scope_label}",
+        f"Sauvegarde  : {_tilde(plan.backup_root)}/<horodatage>/",
+        "",
+        f"Sources Claude détectées ({len(plan.sources)})",
+    ]
+    for source in plan.sources[:40]:
+        lines.append(f"  • {_tilde(source)}")
+    if len(plan.sources) > 40:
+        lines.append(f"  … {len(plan.sources) - 40} de plus")
+    if not plan.sources:
+        lines.append("  (aucune)")
+
+    lines += ["", f"Actions prévues ({len(plan.writes) + len(plan.copies)})"]
+    for item in plan.writes:
+        lines.append(f"  + écrire {_tilde(item['path'])}  ({item['label']})")
+    for item in plan.copies:
+        lines.append(f"  + copier {_tilde(item['src'])} → {_tilde(item['dst'])}")
+    if plan.config_target:
+        counts = []
+        if plan.config_patch.get("permissions"):
+            counts.append(f"{len(plan.config_patch['permissions'])} permission(s)")
+        if plan.config_patch.get("mcp", {}).get("servers"):
+            counts.append(f"{len(plan.config_patch['mcp']['servers'])} serveur(s) MCP")
+        if plan.instructions:
+            counts.append(f"{len(plan.instructions)} instruction(s)")
+        lines.append(
+            f"  ~ fusionner {_tilde(plan.config_target)}  ({', '.join(counts) or 'compléments'})"
+        )
+    if not plan.has_changes():
+        lines.append("  (aucune)")
+
+    if plan.warnings:
+        lines += ["", f"Avertissements ({len(plan.warnings)})"]
+        for warning in plan.warnings:
+            lines.append(f"  ! {warning}")
+    if plan.notes:
+        lines += ["", "Notes"]
+        for note in plan.notes:
+            lines.append(f"  · {note}")
+    if actionable:
+        lines += ["", "y / Entrée = convertir   ·   n / Échap = annuler"]
+    else:
+        lines += ["", "Aucun fichier ne sera écrit. Les avertissements ci-dessus expliquent pourquoi."]
+    return "\n".join(lines)
+
+
+def _backup_base(path: Path, plan: ConversionPlan, backup: Path) -> Path:
+    try:
+        relative = (
+            path.relative_to(Path.home()) if plan.is_global
+            else path.relative_to(plan.scope)
+        )
+    except ValueError:
+        relative = Path("external") / path.name
+    return backup / "sources" / relative
+
+
+def _copy_to_backup(source: Path, plan: ConversionPlan, backup: Path) -> None:
+    destination = _backup_base(source, plan, backup)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+    else:
+        shutil.copy2(source, destination)
+
+
+def _backup_existing(target: Path, plan: ConversionPlan, backup: Path) -> None:
+    try:
+        relative = (
+            target.relative_to(Path.home()) if plan.is_global
+            else target.relative_to(plan.scope)
+        )
+    except ValueError:
+        relative = Path("external") / target.name
+    destination = backup / "existing" / relative
+    if target.exists():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_dir():
+            shutil.copytree(target, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(target, destination)
+
+
+def _merge_opencode_config(plan: ConversionPlan, existing: dict) -> dict:
+    merged = dict(existing)
+    merged.setdefault("$schema", "https://opencode.ai/config.json")
+
+    rules = plan.config_patch.get("permissions") or []
+    if rules:
+        current = merged.get("permissions")
+        if not isinstance(current, list):
+            current = []
+        combined: list[dict] = []
+        for rule in [*rules, *current]:
+            if rule not in combined:
+                combined.append(rule)
+        merged["permissions"] = combined
+
+    patch_mcp = plan.config_patch.get("mcp") or {}
+    patch_servers = patch_mcp.get("servers") or {}
+    if patch_servers:
+        mcp = merged.get("mcp")
+        if not isinstance(mcp, dict):
+            mcp = {}
+            merged["mcp"] = mcp
+        servers = mcp.get("servers")
+        if not isinstance(servers, dict):
+            servers = {}
+            mcp["servers"] = servers
+        for name, config in patch_servers.items():
+            servers.setdefault(name, config)
+
+    instructions = [entry for _, entry in plan.instructions]
+    if instructions:
+        current = merged.get("instructions")
+        if not isinstance(current, list):
+            current = []
+        for entry in instructions:
+            if entry not in current:
+                current.append(entry)
+        merged["instructions"] = current
+    return merged
+
+
+def apply_conversion_plan(plan: ConversionPlan) -> dict:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = plan.backup_root / stamp
+    backup.mkdir(parents=True, exist_ok=True)
+    try:
+        backup.chmod(0o700)
+    except OSError:
+        pass
+
+    for source in plan.sources:
+        _copy_to_backup(source, plan, backup)
+    for name, content in plan.extra_backups:
+        target = backup / "sources" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
+
+    for item in plan.writes:
+        _backup_existing(item["path"], plan, backup)
+    for item in plan.copies:
+        _backup_existing(item["dst"], plan, backup)
+    if plan.config_target:
+        _backup_existing(plan.config_target, plan, backup)
+
+    written: list[Path] = []
+    for item in plan.writes:
+        item["path"].parent.mkdir(parents=True, exist_ok=True)
+        item["path"].write_text(item["content"])
+        written.append(item["path"])
+
+    copied: list[Path] = []
+    for item in plan.copies:
+        item["dst"].parent.mkdir(parents=True, exist_ok=True)
+        if item["src"].is_dir():
+            shutil.copytree(item["src"], item["dst"], dirs_exist_ok=True)
+        else:
+            shutil.copy2(item["src"], item["dst"])
+        copied.append(item["dst"])
+
+    if plan.config_target:
+        existing = _read_jsonc(plan.config_target) if plan.config_target.is_file() else {}
+        if existing is None:
+            plan.warn(f"Fusion annulée : {_tilde(plan.config_target)} invalide.")
+        else:
+            merged = _merge_opencode_config(plan, existing)
+            _write_json_file(plan.config_target, merged, generated=True)
+            written.append(plan.config_target)
+
+    report_lines = [
+        "# Conversion Claude Code → OpenCode",
+        "",
+        f"Date : {_now_label()}",
+        f"Portée : {'globale' if plan.is_global else _tilde(plan.scope)}",
+        f"Sauvegarde : {_tilde(backup)}",
+        "",
+        "## Sources",
+        *[f"- {_tilde(source)}" for source in plan.sources],
+        "",
+        "## Fichiers écrits",
+        *([f"- {_tilde(path)}" for path in written] or ["- (aucun)"]),
+        "",
+        "## Fichiers copiés",
+        *([f"- {_tilde(path)}" for path in copied] or ["- (aucun)"]),
+        "",
+        "## Instructions ajoutées à opencode.json",
+        *([f"- {entry}" for _, entry in plan.instructions] or ["- (aucune)"]),
+        "",
+        "## Avertissements",
+        *([f"- {warning}" for warning in plan.warnings] or ["- (aucun)"]),
+        "",
+        "## Notes",
+        *([f"- {note}" for note in plan.notes] or ["- (aucune)"]),
+        "",
+        "Les fichiers Claude d'origine n'ont pas été modifiés.",
+    ]
+    report_path = backup / "CONVERSION_REPORT.md"
+    report_path.write_text("\n".join(report_lines) + "\n")
+    try:
+        report_path.chmod(0o600)
+    except OSError:
+        pass
+    return {
+        "backup": backup,
+        "report": report_path,
+        "written": written,
+        "copied": copied,
+        "warnings": plan.warnings,
+    }
+
+
+def _conversion_result_text(result: dict) -> str:
+    lines = [
+        "Conversion terminée.",
+        "",
+        f"Sauvegarde : {_tilde(result['backup'])}",
+        f"Rapport    : {_tilde(result['report'])}",
+        "",
+        f"Fichiers écrits ({len(result['written'])})",
+        *([f"  • {_tilde(path)}" for path in result["written"]] or ["  (aucun)"]),
+        "",
+        f"Fichiers copiés ({len(result['copied'])})",
+        *([f"  • {_tilde(path)}" for path in result["copied"]] or ["  (aucun)"]),
+    ]
+    if result["warnings"]:
+        lines += ["", f"Avertissements ({len(result['warnings'])})"]
+        lines += [f"  ! {warning}" for warning in result["warnings"]]
+    lines += ["", "Les originaux Claude sont conservés."]
+    return "\n".join(lines)
+
+
+# ─── Audit bonnes pratiques ────────────────────────────────────────────────────
+
+def _audit_add(checks: list[dict], ok: bool, severity: str, title: str,
+               advice: str = "", weight: int = 0,
+               ok_title: str | None = None) -> None:
+    checks.append({
+        "ok": ok,
+        "severity": "ok" if ok else severity,
+        "title": ok_title if ok and ok_title else title,
+        "advice": advice,
+        "weight": weight,
+    })
+
+
+def _audit_score(checks: list[dict]) -> int:
+    weighted = [check for check in checks if check["weight"] > 0]
+    if not weighted:
+        return 100
+    total = sum(check["weight"] for check in weighted)
+    earned = 0.0
+    for check in weighted:
+        if check["ok"]:
+            earned += check["weight"]
+        elif check["severity"] == "warn":
+            earned += check["weight"] * 0.5
+    return round(100 * earned / total)
+
+
+def _local_opencode_configs(project: Path) -> list[Path]:
+    return [
+        candidate for candidate in (
+            project / "opencode.json",
+            project / "opencode.jsonc",
+            project / ".opencode" / "opencode.json",
+            project / ".opencode" / "opencode.jsonc",
+        ) if candidate.is_file()
+    ]
+
+
+def _looks_python(project: Path) -> bool:
+    if (project / "pyproject.toml").is_file() or (project / "setup.py").is_file():
+        return True
+    if not project.is_dir():
+        return False
+    return any(child.is_file() and child.suffix == ".py" for child in project.iterdir())
+
+
+def _gitignore_lines(project: Path) -> list[str]:
+    path = project / ".gitignore"
+    if not path.is_file():
+        return []
+    return [
+        line.strip() for line in _read_text(path).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _is_gitignored(lines: list[str], name: str) -> bool:
+    for line in lines:
+        cleaned = line.lstrip("/")
+        if cleaned in (name, f"*{name}", f"**/{name}", f"{name}*", f"{name}/*"):
+            return True
+        if fnmatch.fnmatch(name, cleaned):
+            return True
+        if cleaned.endswith("/") and name.startswith(cleaned.rstrip("/")):
+            return True
+    return False
+
+
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+)
+
+
+def audit_project(project: Path) -> dict:
+    checks: list[dict] = []
+    project = project.resolve()
+
+    agents_file = project / "AGENTS.md"
+    claude_file = project / "CLAUDE.md"
+    if agents_file.is_file():
+        _audit_add(checks, True, "info", "AGENTS.md présent")
+        line_count = len(_read_text(agents_file).splitlines())
+        _audit_add(
+            checks, line_count <= 250, "warn",
+            f"AGENTS.md long ({line_count} lignes)",
+            "Viser moins de 200 lignes ; déplacer les procédures dans des skills.",
+            weight=3, ok_title="AGENTS.md concis",
+        )
+    elif claude_file.is_file():
+        _audit_add(
+            checks, False, "critical", "AGENTS.md absent (CLAUDE.md présent)",
+            "OpenCode V2 ne charge pas CLAUDE.md : lancer [C] Convertir Claude → OpenCode "
+            "ou créer AGENTS.md.",
+            weight=5,
+        )
+    else:
+        _audit_add(
+            checks, False, "critical", "Aucune instruction AGENTS.md",
+            "Créer AGENTS.md avec les commandes de build/test et les conventions du projet.",
+            weight=5,
+        )
+
+    if agents_file.is_file() and claude_file.is_file():
+        same = _read_text(agents_file).strip() == _read_text(claude_file).strip()
+        _audit_add(
+            checks, same, "warn", "AGENTS.md et CLAUDE.md divergent",
+            "Éviter deux sources de vérité : conserver AGENTS.md et importer/supprimer CLAUDE.md.",
+            weight=3, ok_title="AGENTS.md et CLAUDE.md identiques",
+        )
+
+    configs = _local_opencode_configs(project)
+    if not configs:
+        _audit_add(
+            checks, False, "info", "Aucune configuration opencode.json",
+            "Optionnel ; en créer une pour les permissions, MCP et instructions.",
+        )
+    for config in configs:
+        data = _read_jsonc(config)
+        _audit_add(
+            checks, data is not None, "critical",
+            f"Configuration OpenCode valide ({_tilde(config)})",
+            "Corriger le JSON/JSONC.", weight=5,
+        )
+        if data is not None and "$schema" not in data:
+            _audit_add(
+                checks, False, "info", f"$schema absent de {_tilde(config)}",
+                'Ajouter "$schema": "https://opencode.ai/config.json".',
+            )
+
+    readme = find_readme(project)
+    if readme is None:
+        _audit_add(
+            checks, False, "critical", "README absent",
+            "Ajouter un README avec installation, usage et exemples.", weight=5,
+        )
+    else:
+        length = len(_read_text(readme))
+        _audit_add(
+            checks, length >= 300, "warn", f"README court ({length} caractères)",
+            "Décrire le but, l'installation, les commandes et un exemple.", weight=3,
+            ok_title="README substantiel",
+        )
+
+    _audit_add(
+        checks, (project / "LICENSE").is_file(), "warn", "LICENSE absente",
+        "Ajouter une licence explicite (MIT, Apache-2.0, etc.).", weight=3,
+        ok_title="LICENSE présente",
+    )
+
+    python_project = _looks_python(project)
+    gitignore = _gitignore_lines(project)
+    if not gitignore:
+        advice = (
+            "Ignorer .venv/, __pycache__/, .env et les caches."
+            if python_project else "Ignorer .env et les fichiers générés."
+        )
+        _audit_add(
+            checks, False, "warn", ".gitignore absent",
+            advice, weight=3,
+        )
+    else:
+        if (project / ".env").is_file():
+            _audit_add(
+                checks, _is_gitignored(gitignore, ".env"), "critical",
+                ".env non ignoré par git",
+                "Ajouter .env (et .env.*) au .gitignore ; ne jamais committer de secrets.",
+                weight=5, ok_title=".env ignoré par git",
+            )
+        if python_project:
+            missing = [
+                name for name in (".venv", "__pycache__")
+                if not _is_gitignored(gitignore, name)
+            ]
+            _audit_add(
+                checks, not missing, "warn",
+                "Entrées .gitignore manquantes : " + ", ".join(missing),
+                "Ajouter .venv/ et __pycache__/ au .gitignore.", weight=3,
+                ok_title="Entrées .gitignore essentielles présentes",
+            )
+
+    pyproject = project / "pyproject.toml"
+    if python_project and not pyproject.is_file():
+        _audit_add(
+            checks, False, "critical", "pyproject.toml absent",
+            "Créer un pyproject.toml (PEP 621) avec les métadonnées et les dépendances.",
+            weight=5,
+        )
+    elif pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            data = None
+        _audit_add(
+            checks, data is not None, "critical", "pyproject.toml valide",
+            "Corriger la syntaxe TOML.", weight=5,
+        )
+        if data is not None:
+            project_data = data.get("project") or {}
+            missing = [
+                key for key in ("name", "version", "description", "requires-python")
+                if not project_data.get(key)
+            ]
+            _audit_add(
+                checks, not missing, "warn",
+                "Métadonnées [project] incomplètes : " + ", ".join(missing),
+                "Renseigner name, version, description et requires-python.", weight=3,
+                ok_title="Métadonnées [project] complètes",
+            )
+            _audit_add(
+                checks, bool(project_data.get("dependencies")), "info",
+                "Dépendances déclarées dans [project]",
+                "Déclarer les dépendances dans [project.dependencies].",
+            )
+            _audit_add(
+                checks, bool(project_data.get("scripts")), "info",
+                "Points d'entrée [project.scripts]",
+                "Ajouter [project.scripts] si le projet expose une commande.",
+            )
+
+        lockfiles = ("uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock")
+        _audit_add(
+            checks, any((project / name).is_file() for name in lockfiles), "warn",
+            "Aucun lockfile",
+            "Committer un lockfile (uv.lock, poetry.lock, etc.) pour des builds reproductibles.",
+            weight=3, ok_title="Lockfile présent",
+        )
+        if (project / "requirements.txt").is_file() and pyproject.is_file():
+            _audit_add(
+                checks, False, "warn", "requirements.txt et pyproject.toml coexistent",
+                "Choisir une source de vérité unique pour les dépendances.", weight=3,
+            )
+
+        has_tests = (
+            (project / "tests").is_dir()
+            or any(project.glob("test_*.py"))
+            or any(project.glob("*_test.py"))
+        )
+        _audit_add(
+            checks, has_tests, "critical", "Aucun test détecté",
+            "Créer tests/ et au moins un test ; ajouter pytest aux dépendances de dev.",
+            weight=5, ok_title="Tests présents",
+        )
+        _audit_add(
+            checks, (project / "tests").is_dir(), "info", "Dossier tests/ présent",
+            "Organiser les tests dans tests/.", weight=0,
+        )
+
+        lint_config = (
+            (project / "ruff.toml").is_file()
+            or (project / ".ruff.toml").is_file()
+            or "[tool.ruff" in _read_text(pyproject)
+        )
+        _audit_add(
+            checks, lint_config, "warn", "Aucun linter/formateur configuré",
+            "Ajouter ruff (lint + format) dans [tool.ruff] et les dépendances de dev.",
+            weight=3, ok_title="Linter/formateur configuré",
+        )
+        type_config = (
+            (project / "mypy.ini").is_file()
+            or (project / "pyrightconfig.json").is_file()
+            or "[tool.mypy" in _read_text(pyproject)
+            or "[tool.pyright" in _read_text(pyproject)
+        )
+        _audit_add(
+            checks, type_config, "info", "Aucun vérificateur de types configuré",
+            "Ajouter mypy ou pyright pour les projets Python sérieux.",
+            ok_title="Vérificateur de types configuré",
+        )
+
+    ci = (
+        (project / ".gitlab-ci.yml").is_file()
+        or (project / ".github" / "workflows").is_dir()
+        or (project / ".circleci" / "config.yml").is_file()
+    )
+    _audit_add(
+        checks, ci, "warn", "Aucune intégration continue",
+        "Ajouter un workflow CI (tests + lint) dans .github/workflows/.", weight=3,
+        ok_title="Intégration continue configurée",
+    )
+
+    if python_project:
+        _audit_add(
+            checks, (project / "src").is_dir(), "info", "Layout src/ absent",
+            "Envisager src/ pour éviter les imports accidentels.",
+            ok_title="Layout src/ présent",
+        )
+        _audit_add(
+            checks, (project / "py.typed").is_file() or
+            ((project / "src").is_dir() and any((project / "src").rglob("py.typed"))),
+            "info", "py.typed absent",
+            "Ajouter py.typed si le package expose des types.",
+            ok_title="py.typed présent",
+        )
+    for name, label in (
+        ("CHANGELOG.md", "CHANGELOG"), ("CONTRIBUTING.md", "CONTRIBUTING"),
+        ("docs", "docs/"), ("Makefile", "Makefile"), ("justfile", "justfile"),
+        ("pre-commit-config.yaml", ".pre-commit-config.yaml"),
+    ):
+        present = (project / name).exists()
+        _audit_add(
+            checks, present, "info", f"{label} absent",
+            f"Ajouter {label} pour la maintenance du projet.",
+            ok_title=f"{label} présent",
+        )
+
+    secret_files = configs + [project / ".mcp.json"]
+    for path in secret_files:
+        if not path.is_file():
+            continue
+        if _SECRET_RE.search(_read_text(path)):
+            _audit_add(
+                checks, False, "critical", f"Secret potentiel dans {_tilde(path)}",
+                "Déplacer les secrets dans des variables d'environnement ({env:...}).",
+                weight=5,
+            )
+
+    score = _audit_score(checks)
+    return {
+        "scope": project,
+        "label": _short_path(project) or str(project),
+        "checks": checks,
+        "score": score,
+        "python": python_project,
+    }
+
+
+def audit_global() -> dict:
+    checks: list[dict] = []
+    agents_file = OPENCODE_CONFIG_DIR / "AGENTS.md"
+    claude_file = CLAUDE_CONFIG_DIR / "CLAUDE.md"
+    if agents_file.is_file():
+        _audit_add(checks, True, "info", "AGENTS.md global présent")
+    elif claude_file.is_file():
+        _audit_add(
+            checks, False, "warn", "AGENTS.md global absent (CLAUDE.md présent)",
+            "Lancer [C] sur la ligne Global pour convertir les instructions globales.",
+            weight=3,
+        )
+    else:
+        _audit_add(
+            checks, False, "info", "Aucun AGENTS.md global",
+            "Optionnel : ajouter ~/.config/opencode/AGENTS.md pour tes préférences.",
+        )
+
+    configs = [
+        candidate for candidate in (
+            OPENCODE_CONFIG_DIR / "opencode.json",
+            OPENCODE_CONFIG_DIR / "opencode.jsonc",
+        ) if candidate.is_file()
+    ]
+    if not configs:
+        _audit_add(
+            checks, False, "info", "Aucune configuration OpenCode globale",
+            "Créer ~/.config/opencode/opencode.jsonc.",
+        )
+    for config in configs:
+        data = _read_jsonc(config)
+        _audit_add(
+            checks, data is not None, "critical",
+            f"Configuration globale valide ({_tilde(config)})",
+            "Corriger le JSON/JSONC.", weight=5,
+        )
+        if data is not None and "$schema" not in data:
+            _audit_add(
+                checks, False, "info", f"$schema absent de {_tilde(config)}",
+                'Ajouter "$schema": "https://opencode.ai/config.json".',
+            )
+
+    for path, label in (
+        (OPENCODE_CONFIG_DIR / "commands", "commands/ global"),
+        (OPENCODE_CONFIG_DIR / "agents", "agents/ global"),
+        (OPENCODE_CONFIG_DIR / "skills", "skills/ global"),
+    ):
+        _audit_add(
+            checks, path.is_dir(), "info", f"Aucun {label}",
+            f"Créer {_tilde(path)} si tu veux des commandes/agents/skills partagés.",
+        )
+
+    if CLAUDE_CONFIG_DIR.is_dir():
+        leftover = [
+            name for name in ("CLAUDE.md", "settings.json", "commands", "agents", "rules")
+            if (CLAUDE_CONFIG_DIR / name).exists()
+        ]
+        _audit_add(
+            checks, not leftover, "info",
+            "Configuration Claude globale encore présente : " + ", ".join(leftover),
+            "Normal si tu utilises encore Claude Code ; sinon, conserver la sauvegarde "
+            "et retirer les fichiers migrés.",
+        )
+
+    score = _audit_score(checks)
+    return {
+        "scope": OPENCODE_CONFIG_DIR,
+        "label": "Global (~/.claude → ~/.config/opencode)",
+        "checks": checks,
+        "score": score,
+        "python": False,
+    }
+
+
+def format_audit_report(audit: dict) -> str:
+    score = audit["score"]
+    if score >= 80:
+        label = "Bon"
+    elif score >= 55:
+        label = "À améliorer"
+    else:
+        label = "Critique"
+    lines = [
+        f"Score : {score}/100 — {label}",
+        f"Portée : {_tilde(audit['scope'])}",
+        "",
+    ]
+    groups = [
+        ("critical", "CRITIQUE"),
+        ("warn", "IMPORTANT"),
+        ("info", "INFO"),
+    ]
+    failures = [check for check in audit["checks"] if not check["ok"]]
+    for severity, title in groups:
+        group = [check for check in failures if check["severity"] == severity]
+        if not group:
+            continue
+        lines.append(title)
+        for check in group:
+            marker = "✗" if severity == "critical" else ("!" if severity == "warn" else "·")
+            lines.append(f"  {marker} {check['title']}")
+            if check["advice"]:
+                lines.append(f"      → {check['advice']}")
+        lines.append("")
+
+    strengths = [check for check in audit["checks"] if check["ok"]]
+    if strengths:
+        lines.append(f"POINTS FORTS ({len(strengths)})")
+        for check in strengths[:15]:
+            lines.append(f"  ✓ {check['title']}")
+        if len(strengths) > 15:
+            lines.append(f"  … {len(strengths) - 15} de plus")
+        lines.append("")
+
+    if not failures:
+        lines.append("Aucun problème détecté par cet audit heuristique.")
+    else:
+        lines.append(
+            f"{len(failures)} point(s) à corriger. Audit heuristique : adapter au contexte du projet."
+        )
+    return "\n".join(lines)
+
+
 # ─── README & schéma Mermaid ───────────────────────────────────────────────────
 
 _README_NAMES = ("README.md", "README.rst", "README.txt", "README")
@@ -1836,6 +3428,8 @@ class ReadmeOverlay(ModalScreen):
         Binding("s",      "dismiss_overlay", "Fermer", show=False),
         Binding("a",      "dismiss_overlay", "Fermer", show=False),
         Binding("c",      "dismiss_overlay", "Fermer", show=False),
+        Binding("A",      "dismiss_overlay", "Fermer", show=False),
+        Binding("C",      "dismiss_overlay", "Fermer", show=False),
         Binding("escape", "dismiss_overlay", "Fermer", show=True),
         Binding("q",      "dismiss_overlay", "Fermer", show=False),
     ]
@@ -1903,6 +3497,47 @@ class ConfirmOverlay(ModalScreen):
             yield Static(f"[bold bright_red]{self._title}[/bold bright_red]", id="confirm-title")
             yield Static(self._body, markup=False)
             yield Static("[dim]y / Entrée = confirmer  ·  n / Échap = annuler[/dim]")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class ConversionOverlay(ModalScreen):
+    """Prévisualisation d'une conversion Claude Code → OpenCode."""
+
+    BINDINGS = [
+        Binding("y",      "confirm", "Convertir", show=True),
+        Binding("enter",  "confirm", "Convertir", show=True),
+        Binding("n",      "cancel",  "Annuler",   show=True),
+        Binding("escape", "cancel",  "Annuler",   show=True),
+        Binding("q",      "cancel",  "Annuler",   show=False),
+    ]
+
+    CSS = """
+    ConversionOverlay { align: center middle; }
+    #conversion-panel {
+        width: 92%;
+        height: 85%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #conversion-title { text-style: bold; color: $accent; padding-bottom: 1; }
+    """
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="conversion-panel"):
+            yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]", id="conversion-title")
+            yield Static(self._body, markup=False)
+            yield Static("[dim]y / Entrée = convertir   ·   n / Échap = annuler[/dim]")
 
     def action_confirm(self) -> None:
         self.dismiss(True)
@@ -2030,6 +3665,8 @@ class AliasMenu(App):
         Binding("a",          "show_agents",   "AGENTS.md", show=False),
         Binding("c",          "show_opencode_config", "opencode.json", show=False),
         Binding("x",          "delete_session", "Supprimer la session", show=False),
+        Binding("C",          "convert_claude", "Convertir Claude → OpenCode", show=False),
+        Binding("A",          "audit_project",  "Audit bonnes pratiques", show=False),
         Binding("m",          "show_mermaid",      "Pkg (M:HTML)", show=True),
         Binding("M",          "show_mermaid_html", "Structure interne (HTML)", show=False),
         Binding("g",          "show_dep_graph_terminal", "Deps (G:HTML)", show=True),
@@ -2055,6 +3692,8 @@ class AliasMenu(App):
                 yield DataTable(id="dups-table", zebra_stripes=True, cursor_type="row")
             with TabPane("  opencode  ", id="tab-opencode"):
                 yield DataTable(id="sessions-table", zebra_stripes=True, cursor_type="row")
+            with TabPane("  Migration  ", id="tab-migration"):
+                yield DataTable(id="migration-table", zebra_stripes=True, cursor_type="row")
         yield Label("", id="status", markup=False)
         yield Footer()
 
@@ -2072,9 +3711,14 @@ class AliasMenu(App):
         self._sessions_loaded = False
         self._sessions_active: set[str] = set()
         self._sessions_error: str | None = None
+        self.migration_entries: list[dict] = []
+        self._migration_rows: list[dict | None] = []
+        self._migration_loaded = False
+        self._migration_error: str | None = None
         self._init_tools_placeholder()
         self._init_dups_placeholder()
         self._init_sessions_placeholder()
+        self._init_migration_placeholder()
         self.query_one("#alias-table", DataTable).focus()
 
     def _init_tools_placeholder(self) -> None:
@@ -2094,6 +3738,12 @@ class AliasMenu(App):
         t.clear(columns=True)
         t.add_columns("  ▶  ", "Titre", "Agent · Modèle", "Modifié", "Coût")
         t.add_row("", "[dim]Active cet onglet pour charger les sessions opencode…[/dim]", "", "", "")
+
+    def _init_migration_placeholder(self) -> None:
+        t = self.query_one("#migration-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("  C  ", "Projet", "Claude", "OpenCode", "État", "Dernière session")
+        t.add_row("", "[dim]Active cet onglet pour analyser les projets…[/dim]", "", "", "", "")
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Désactive les raccourcis de l'app tant qu'un overlay modal est ouvert.
@@ -2163,6 +3813,11 @@ class AliasMenu(App):
             if not self._sessions_loaded:
                 self._load_sessions()
             self._session_status()
+        elif active == "tab-migration":
+            self.query_one("#migration-table", DataTable).focus()
+            if not self._migration_loaded:
+                self._load_migration()
+            self._migration_status()
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -2418,6 +4073,169 @@ class AliasMenu(App):
             f"[a] AGENTS.md  ·  [c] opencode.json  ·  [t] arbre  ·  [x] supprimer"
         )
 
+    # ── migration / audit loader ─────────────────────────────────────────────
+
+    def _load_migration(self) -> None:
+        self._migration_loaded = True
+        self._migration_error = None
+        if not self.sessions_entries:
+            discovered = list_opencode_sessions()
+            if discovered:
+                self.sessions_entries = discovered
+        projects: dict[str, dict] = {}
+        for session in self.sessions_entries:
+            directory = (session.get("location") or {}).get("directory")
+            if not directory:
+                continue
+            entry = projects.setdefault(directory, {
+                "type": "migration",
+                "directory": directory,
+                "is_global": False,
+                "sessions": 0,
+                "last_used": 0,
+            })
+            entry["sessions"] += 1
+            entry["last_used"] = max(
+                entry["last_used"], (session.get("time") or {}).get("updated") or 0,
+            )
+        cwd = str(Path.cwd().resolve())
+        projects.setdefault(cwd, {
+            "type": "migration",
+            "directory": cwd,
+            "is_global": False,
+            "sessions": 0,
+            "last_used": 0,
+        })
+
+        entries: list[dict] = [{
+            "type": "migration",
+            "directory": str(Path.home()),
+            "is_global": True,
+            "sessions": 0,
+            "last_used": 0,
+        }]
+        entries.extend(
+            sorted(projects.values(), key=lambda item: item["last_used"], reverse=True)
+        )
+        for entry in entries:
+            claude = self._claude_artifacts(entry)
+            opencode = self._opencode_artifacts(entry)
+            entry["claude_count"] = len(claude)
+            entry["opencode_count"] = len(opencode)
+            if claude and not opencode:
+                entry["state"] = "à convertir"
+            elif claude and opencode:
+                entry["state"] = "mixte"
+            elif opencode:
+                entry["state"] = "OpenCode seul"
+            else:
+                entry["state"] = "vide"
+        self.migration_entries = entries
+        self._render_migration_table()
+        if self._active_tab() == "tab-migration":
+            self._migration_status()
+
+    def _claude_artifacts(self, entry: dict) -> list[str]:
+        if entry["is_global"]:
+            candidates = [
+                ("CLAUDE.md", CLAUDE_CONFIG_DIR / "CLAUDE.md"),
+                ("settings.json", CLAUDE_CONFIG_DIR / "settings.json"),
+                ("commands/", CLAUDE_CONFIG_DIR / "commands"),
+                ("agents/", CLAUDE_CONFIG_DIR / "agents"),
+                ("skills/", CLAUDE_CONFIG_DIR / "skills"),
+                ("rules/", CLAUDE_CONFIG_DIR / "rules"),
+            ]
+            if CLAUDE_GLOBAL_JSON.is_file():
+                candidates.append(("mcpServers", CLAUDE_GLOBAL_JSON))
+        else:
+            project = Path(entry["directory"])
+            candidates = [
+                ("CLAUDE.md", project / "CLAUDE.md"),
+                (".claude/CLAUDE.md", project / ".claude" / "CLAUDE.md"),
+                ("CLAUDE.local.md", project / "CLAUDE.local.md"),
+                (".claude/settings.json", project / ".claude" / "settings.json"),
+                (".claude/settings.local.json", project / ".claude" / "settings.local.json"),
+                (".claude/commands/", project / ".claude" / "commands"),
+                (".claude/agents/", project / ".claude" / "agents"),
+                (".claude/skills/", project / ".claude" / "skills"),
+                (".claude/rules/", project / ".claude" / "rules"),
+                (".mcp.json", project / ".mcp.json"),
+            ]
+        return [label for label, path in candidates if path.exists()]
+
+    def _opencode_artifacts(self, entry: dict) -> list[str]:
+        if entry["is_global"]:
+            candidates = [
+                ("AGENTS.md", OPENCODE_CONFIG_DIR / "AGENTS.md"),
+                ("opencode.json", OPENCODE_CONFIG_DIR / "opencode.json"),
+                ("opencode.jsonc", OPENCODE_CONFIG_DIR / "opencode.jsonc"),
+                ("commands/", OPENCODE_CONFIG_DIR / "commands"),
+                ("agents/", OPENCODE_CONFIG_DIR / "agents"),
+                ("skills/", OPENCODE_CONFIG_DIR / "skills"),
+                ("instructions/", OPENCODE_CONFIG_DIR / "instructions"),
+            ]
+        else:
+            project = Path(entry["directory"])
+            candidates = [
+                ("AGENTS.md", project / "AGENTS.md"),
+                ("opencode.json", project / "opencode.json"),
+                ("opencode.jsonc", project / "opencode.jsonc"),
+                (".opencode/opencode.json", project / ".opencode" / "opencode.json"),
+                (".opencode/opencode.jsonc", project / ".opencode" / "opencode.jsonc"),
+                (".opencode/commands/", project / ".opencode" / "commands"),
+                (".opencode/agents/", project / ".opencode" / "agents"),
+                (".opencode/skills/", project / ".opencode" / "skills"),
+                (".opencode/instructions/", project / ".opencode" / "instructions"),
+            ]
+        return [label for label, path in candidates if path.exists()]
+
+    def _render_migration_table(self) -> None:
+        t = self.query_one("#migration-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("  C  ", "Projet", "Claude", "OpenCode", "État", "Dernière session")
+        self._migration_rows = []
+        if self._migration_error:
+            t.add_row("", f"[dim]{escape(self._migration_error)}[/dim]", "", "", "", "")
+            self._migration_rows.append(None)
+            return
+        for entry in self.migration_entries:
+            if entry["is_global"]:
+                label = "Global (~/.claude)"
+            else:
+                label = _short_path(entry["directory"]) or entry["directory"]
+            state = entry["state"]
+            if state == "à convertir":
+                state_cell = "[bold magenta]à convertir[/bold magenta]"
+            elif state == "mixte":
+                state_cell = "[yellow]mixte[/yellow]"
+            elif state == "OpenCode seul":
+                state_cell = "[green]OpenCode seul[/green]"
+            else:
+                state_cell = "[dim]vide[/dim]"
+            last = _humanize_since(entry["last_used"]) if entry["last_used"] else "—"
+            t.add_row(
+                "[bold magenta]  [C]  [/bold magenta]",
+                f"[bold yellow]{escape(label)}[/bold yellow]",
+                f"{entry['claude_count']} fichier(s)",
+                f"{entry['opencode_count']} fichier(s)",
+                state_cell,
+                f"[dim]{last}[/dim]",
+                key=f"m{len(self._migration_rows)}",
+            )
+            self._migration_rows.append(entry)
+
+    def _migration_status(self) -> None:
+        if self._migration_error:
+            self._status(self._migration_error)
+            return
+        total = len(self.migration_entries)
+        todo = sum(1 for entry in self.migration_entries if entry["state"] == "à convertir")
+        self._status(
+            f"{total} portée(s) · {todo} à convertir  ·  "
+            f"[C] convertir Claude → OpenCode  ·  [A] audit bonnes pratiques  ·  "
+            f"[d] docs  ·  [t] arbre  ·  [r] rescan  ·  [s] dernier rapport"
+        )
+
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _status(self, msg: str) -> None:
@@ -2455,6 +4273,13 @@ class AliasMenu(App):
                 return self._session_rows[row]
             return None
 
+        if active == "tab-migration":
+            t = self.query_one("#migration-table", DataTable)
+            row = t.cursor_row
+            if 0 <= row < len(self._migration_rows):
+                return self._migration_rows[row]
+            return None
+
         t = self.query_one("#tools-table", DataTable)
         row = t.cursor_row
         if 0 <= row < len(self._tool_rows):
@@ -2465,6 +4290,9 @@ class AliasMenu(App):
 
     def action_run_entry(self) -> None:
         active = self._active_tab()
+        if active == "tab-migration":
+            self._status("[C] convertir Claude → OpenCode  ·  [A] audit  ·  [d] docs  ·  [t] arbre")
+            return
         if active == "tab-opencode":
             entry = self._current()
             if entry:
@@ -2601,6 +4429,8 @@ class AliasMenu(App):
         if active == "tab-opencode" and entry:
             directory = (entry.get("location") or {}).get("directory")
             return Path(directory) if directory else None
+        if active == "tab-migration" and entry:
+            return Path(entry["directory"])
         if active in ("tab-tools", "tab-dups") and entry:
             return Path(entry["tool_dir"])
         return Path.cwd()
@@ -2654,6 +4484,77 @@ class AliasMenu(App):
         self._load_sessions()
         self._status(f"Session supprimée : {title}")
 
+    # ── actions : migration Claude → OpenCode ───────────────────────────────
+
+    def action_convert_claude(self) -> None:
+        if self._active_tab() != "tab-migration":
+            return
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne un projet à convertir")
+            return
+        scope = Path(entry["directory"])
+        self._status(f"Analyse de {entry['directory']}…")
+        try:
+            plan = build_claude_conversion_plan(scope, is_global=entry["is_global"])
+        except Exception as exc:  # noqa: BLE001 - ne jamais faire tomber la TUI
+            self._status(f"Erreur pendant l'analyse : {exc}")
+            return
+        if not plan.has_changes():
+            self.push_screen(
+                ReadmeOverlay(
+                    "◆ Claude → OpenCode — rien à convertir",
+                    _plan_summary(plan, actionable=False),
+                    markup=False, hint="C",
+                )
+            )
+            return
+        title = f"◆ Conversion Claude → OpenCode — {_short_path(scope) if not entry['is_global'] else 'Global'}"
+        self.push_screen(
+            ConversionOverlay(title, _plan_summary(plan)),
+            lambda confirmed: self._apply_conversion(plan) if confirmed else None,
+        )
+
+    def _apply_conversion(self, plan: ConversionPlan) -> None:
+        try:
+            result = apply_conversion_plan(plan)
+        except Exception as exc:  # noqa: BLE001 - ne jamais faire tomber la TUI
+            self._status(f"Échec de la conversion : {exc}")
+            return
+        self._migration_loaded = False
+        self._load_migration()
+        self.push_screen(
+            ReadmeOverlay(
+                "◆ Conversion terminée",
+                _conversion_result_text(result),
+                markup=False, hint="d",
+            )
+        )
+
+    def action_audit_project(self) -> None:
+        if self._active_tab() != "tab-migration":
+            return
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne un projet à auditer")
+            return
+        self._status(f"Audit de {entry['directory']}…")
+        try:
+            audit = audit_global() if entry["is_global"] else audit_project(Path(entry["directory"]))
+        except Exception as exc:  # noqa: BLE001 - ne jamais faire tomber la TUI
+            self._status(f"Erreur pendant l'audit : {exc}")
+            return
+        title = f"◆ Audit bonnes pratiques — {audit['label']}"
+        self.push_screen(ReadmeOverlay(title, format_audit_report(audit), markup=False, hint="A"))
+
+    def _latest_conversion_report(self, entry: dict) -> Path | None:
+        root = (
+            OPENCODE_CONFIG_DIR / ".claude-backup" if entry["is_global"]
+            else Path(entry["directory"]) / ".claude-backup"
+        )
+        reports = sorted(root.glob("*/CONVERSION_REPORT.md"))
+        return reports[-1] if reports else None
+
     # ── action : man / help ─────────────────────────────────────────────────
 
     def action_show_help(self) -> None:
@@ -2666,6 +4567,10 @@ class AliasMenu(App):
             self._status(
                 f"cd '{directory}' && opencode --session {entry.get('id', '?')}"
             )
+            return
+
+        if entry.get("type") == "migration":
+            self._status("[C] convertir Claude → OpenCode  ·  [A] audit bonnes pratiques")
             return
 
         if entry["type"] == "alias":
@@ -2723,6 +4628,19 @@ class AliasMenu(App):
             title = escape(f"◆ {entry.get('title') or 'session'}  —  {_short_path(target_dir)}")
             self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
             return
+        if active == "tab-migration":
+            entry = self._current()
+            if not entry:
+                self._status("Sélectionne un projet pour voir son arbre")
+                return
+            target_dir = Path(entry["directory"])
+            if not target_dir.is_dir():
+                self._status(f"Répertoire introuvable : {target_dir}")
+                return
+            label = "Global" if entry["is_global"] else _short_path(target_dir)
+            title = escape(f"◆ {label}  —  {_short_path(target_dir)}")
+            self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
+            return
         if active not in ("tab-tools", "tab-dups") or not self._tools_loaded:
             return
         entry = self._current()
@@ -2746,6 +4664,22 @@ class AliasMenu(App):
         self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
 
     def action_toggle_detail(self) -> None:
+        if self._active_tab() == "tab-migration":
+            entry = self._current()
+            if not entry:
+                self._status("Sélectionne une portée pour voir son dernier rapport")
+                return
+            report = self._latest_conversion_report(entry)
+            if report is None:
+                self._status("Aucun rapport de conversion — lance [C] pour convertir")
+                return
+            self.push_screen(
+                ReadmeOverlay(
+                    f"◆ Dernier rapport — {_tilde(report.parent)}",
+                    _read_text(report), markup=False, hint="s",
+                )
+            )
+            return
         if self._active_tab() == "tab-opencode":
             entry = self._current()
             if not entry:
@@ -2774,6 +4708,17 @@ class AliasMenu(App):
                 return
             text = format_opencode_docs(Path(directory), instructions=True, config=True)
             title = escape(f"◆ {entry.get('title') or 'session'}  —  documents opencode")
+            self.push_screen(ReadmeOverlay(title, text, markup=False, hint="d"))
+            return
+        if self._active_tab() == "tab-migration":
+            entry = self._current()
+            if not entry:
+                self._status("Sélectionne un projet pour afficher ses documents")
+                return
+            directory = Path(entry["directory"])
+            text = format_opencode_docs(directory, instructions=True, config=True)
+            label = "Global" if entry["is_global"] else _short_path(directory)
+            title = escape(f"◆ {label}  —  documents Claude/OpenCode")
             self.push_screen(ReadmeOverlay(title, text, markup=False, hint="d"))
             return
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
@@ -2875,12 +4820,19 @@ class AliasMenu(App):
         if self._active_tab() == "tab-opencode":
             self._load_sessions()
             return
+        if self._active_tab() == "tab-migration":
+            self._migration_loaded = False
+            self._load_migration()
+            return
         self._load_aliases()
         self._load_functions()
         if self._tools_loaded:
             self._load_tools()
         if self._sessions_loaded:
             self._load_sessions()
+        if self._migration_loaded:
+            self._migration_loaded = False
+            self._load_migration()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

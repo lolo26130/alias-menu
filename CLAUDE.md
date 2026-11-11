@@ -8,23 +8,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv run aliases_menu.py
 ```
 
-This is a [PEP 723](https://peps.python.org/pep-0723/) self-contained script — `uv` reads the inline `# dependencies` header and installs `textual` automatically. No virtualenv setup required.
+This is a [PEP 723](https://peps.python.org/pep-0723/) self-contained script — `uv` reads the inline `# dependencies` header (textual, json5, pyyaml) and installs them automatically. No virtualenv setup required.
 
 ## Architecture
 
 Everything lives in a single file: **`aliases_menu.py`**.
 
-The app is a Textual TUI with five tabs, each backed by a `DataTable`:
+The app is a Textual TUI with six tabs, each backed by a `DataTable`:
 
 - **Alias** — parses `~/.bash_aliases` via `parse_aliases()`
 - **Fonctions** — parses `~/.bash_functions` via `parse_functions()`
 - **Outils uv** — lazy-loaded on first tab activation via `parse_uv_tools()`
 - **Duplicates** — derived from the uv tools scan
 - **opencode** — lazy-loaded on first activation via `list_opencode_sessions()`
+- **Migration** — Claude Code → OpenCode conversion and project best-practices audit
 
 ### Data model
 
-All entries are plain `dict`s with a `"type"` key: `"section"` | `"alias"` | `"func"` | `"tool"` | `"session"`. Section entries become visual separators in the table rows (rendered by `_sec_row()`). The `_current()` method returns the dict under the cursor, or `None` if the cursor is on a section row. opencode session entries are the API `Session.Info` objects with an added `"type": "session"`.
+All entries are plain `dict`s with a `"type"` key: `"section"` | `"alias"` | `"func"` | `"tool"` | `"session"` | `"migration"`. Section entries become visual separators in the table rows (rendered by `_sec_row()`). The `_current()` method returns the dict under the cursor, or `None` if the cursor is on a section row. opencode session entries are the API `Session.Info` objects with an added `"type": "session"`.
 
 ### Section detection in bash files
 
@@ -93,6 +94,61 @@ opencode api GET '/api/session/active'
 The overlays reuse `ReadmeOverlay(..., markup=False)` so brackets in Markdown or
 JSONC are not interpreted as Textual markup.
 
+### Migration Claude Code → OpenCode (`tab-migration`)
+
+The Migration tab lists the global scope (`~/.claude` → `~/.config/opencode`) plus
+every project directory found in OpenCode sessions and the current working
+directory. It shows Claude artifacts, OpenCode artifacts, and a state
+(`à convertir`, `mixte`, `OpenCode seul`, `vide`).
+
+- `C` builds a `ConversionPlan` without writing anything
+  (`build_claude_conversion_plan`), shows a preview in `ConversionOverlay`, and
+  applies it only after `y`/`Enter`.
+- `A` runs `audit_project()` or `audit_global()` and opens the scored report.
+- `s` opens the latest `CONVERSION_REPORT.md` from `.claude-backup/<timestamp>/`.
+- `d` / `t` reuse the OpenCode documents overlay and directory tree.
+- `r` rescans the selected scope list.
+
+Conversion details:
+
+- Discovered sources: `CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md`,
+  `.claude/settings.json`, `.claude/settings.local.json`, `.claude/commands/`,
+  `.claude/agents/`, `.claude/skills/`, `.claude/rules/`, `.mcp.json`, global
+  `~/.claude/settings.json`, and `mcpServers` from `~/.claude.json`.
+- Every source is copied to `.claude-backup/<timestamp>/sources/`; existing
+  destination files are copied to `.claude-backup/<timestamp>/existing/`.
+  Originals are never modified.
+- `CLAUDE.md` is appended to `AGENTS.md` (with duplicate detection), with
+  `CLAUDE.md` → `AGENTS.md` and `Claude Code` → `OpenCode` substitutions.
+  `@path` imports are added to the `instructions` array.
+- `CLAUDE.local.md` goes to `.opencode/instructions/claude-local.md` and is
+  loaded through `instructions` (warned as personal/possibly committed).
+- Claude `permissions` are translated to OpenCode `permissions`
+  (`Bash`→`shell`, `Read`→`read`, `Edit`/`Write`→`edit`, MCP tools→normalized
+  server/tool actions, effects `allow`/`ask`/`deny`).
+- `.claude/commands/*.md` → `.opencode/commands/`, `.claude/agents/*.md` →
+  `.opencode/agents/` (mode subagent, tools→permissions, maxTurns→steps),
+  `.claude/skills/*/SKILL.md` → `.opencode/skills/` (supporting files copied),
+  `.claude/rules/*.md` → `.opencode/instructions/claude-rules/` plus an
+  `instructions` entry.
+- `.mcp.json` / `~/.claude.json` `mcpServers` → `mcp.servers` (local/remote).
+- Unsupported hooks, env, Claude model aliases, status line, plugins, etc. are
+  reported in warnings and preserved in the backup; no false equivalence is
+  written.
+- Existing `opencode.json(c)` is merged with `json5` (comments in a `.jsonc`
+  file are not preserved in the rewritten file, but the original is backed up).
+  Existing OpenCode permission rules are kept after imported rules so they keep
+  precedence. `json5` and `pyyaml` are declared in the PEP 723 header.
+
+Audit details (`audit_project` / `audit_global`):
+
+- Checks AGENTS.md presence/size, CLAUDE.md divergence, OpenCode config validity
+  and `$schema`, README, LICENSE, .gitignore/.env, pyproject metadata, lockfile,
+  tests, lint/format, type checking, CI, src layout, py.typed, docs/changelog,
+  and potential secrets.
+- Weighted score: critical=5, warn=3, info=0; warnings count half. The report
+  groups findings into CRITIQUE / IMPORTANT / INFO / POINTS FORTS.
+
 ### Key bindings
 
 | Key | Action |
@@ -101,18 +157,20 @@ JSONC are not interpreted as Textual markup.
 | `h` | Show `man` page (alias/tool), function body, or the equivalent `opencode --session` command |
 | `r` | Reload source files and, if already loaded, tools and opencode sessions |
 | `t` | Toggle directory tree overlay for the selected tool/session |
-| `s` | Toggle detail columns (tools) or show session statistics (opencode) |
-| `d` | Show README overlay (tools) or opencode documents (session) |
+| `s` | Toggle detail columns (tools), show session statistics (opencode), or open the latest conversion report (Migration) |
+| `d` | Show README overlay (tools), opencode documents (session), or Claude/OpenCode documents (Migration) |
 | `a` | Show AGENTS.md / existing CLAUDE.md files for the selection (or cwd) |
 | `c` | Show global and project opencode.json(c) files for the selection (or cwd) |
 | `x` | Delete the selected opencode session (confirmation required) |
+| `C` | Convert the selected Migration scope from Claude Code to OpenCode (preview + confirmation) |
+| `A` | Audit the selected Migration scope against best practices |
 | `m` / `M` | Package module structure — terminal text / HTML in browser |
 | `g` / `G` | Cross-package dependency graph — terminal text / HTML in browser |
 | `Ctrl+→` / `Ctrl+←` / `Tab` | Switch tabs |
 
 ### Modal overlays
 
-Each overlay (`DirTreeOverlay`, `ReadmeOverlay`, `SchemaOverlay`, `DepGraphOverlay`, `ConfirmOverlay`) is a `ModalScreen` with its own dismiss binding matching the key that opened it (e.g., `d` closes `ReadmeOverlay`). `ConfirmOverlay` is keyboard-only: `y`/`Enter` confirms, `n`/`Esc`/`q` cancels.
+Each overlay (`DirTreeOverlay`, `ReadmeOverlay`, `SchemaOverlay`, `DepGraphOverlay`, `ConfirmOverlay`, `ConversionOverlay`) is a `ModalScreen` with its own dismiss binding matching the key that opened it (e.g., `d` closes `ReadmeOverlay`). `ConfirmOverlay` is keyboard-only: `y`/`Enter` confirms, `n`/`Esc`/`q` cancels. `ConversionOverlay` previews a Claude → OpenCode plan with `y`/`Enter` to apply.
 
 ### Running alias/function entries
 
