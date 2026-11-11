@@ -8,15 +8,27 @@ de chaque commande.
 
 ## Fonctionnalités
 
-- Deux onglets : **Alias** et **Fonctions**
+- Onglets **Alias**, **Fonctions**, **packages pip/uv**, **Duplicates** et **opencode**
 - Sections visuelles regroupant les commandes (détectées automatiquement à partir
   des blocs `#===...===` dans les fichiers source)
 - `Space` : lance l'alias / la fonction sélectionnée
   - pour une fonction qui attend des arguments, le prompt est pré-rempli
     avec son nom : tu n'as qu'à taper les arguments et valider
-- `H` : affiche le `man` de la commande (saute automatiquement `sudo` en tête de
+- `h` : affiche le `man` de la commande (saute automatiquement `sudo` en tête de
   commande) ou, pour une fonction, son corps source
-- `R` : recharge les fichiers sans relancer l'appli
+- `r` : recharge les fichiers sans relancer l'appli
+
+### Onglet opencode
+
+- Liste toutes les sessions OpenCode du PC, regroupées par projet, avec agent,
+  modèle, date de modification et coût ; les sessions en cours sont marquées `⏺`.
+- `Space` : reprend la session sélectionnée dans son répertoire de travail.
+- `s` : statistiques de la session (coût, tokens, derniers prompts, dernière réponse).
+- `d` : affiche les documents de la session (`AGENTS.md`, `CLAUDE.md` existants,
+  `opencode.json` / `opencode.jsonc` global et projet).
+- `a` : uniquement `AGENTS.md` / `CLAUDE.md` ; `c` : uniquement la configuration.
+- `t` : arbre du répertoire de la session.
+- `x` : supprime la session après confirmation.
 - `Ctrl+→` / `Ctrl+←` : change d'onglet (clic souris aussi possible)
 
 ## Installation / usage

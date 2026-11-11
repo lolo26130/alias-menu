@@ -14,15 +14,17 @@ This is a [PEP 723](https://peps.python.org/pep-0723/) self-contained script —
 
 Everything lives in a single file: **`aliases_menu.py`**.
 
-The app is a Textual TUI with three tabs, each backed by a `DataTable`:
+The app is a Textual TUI with five tabs, each backed by a `DataTable`:
 
 - **Alias** — parses `~/.bash_aliases` via `parse_aliases()`
 - **Fonctions** — parses `~/.bash_functions` via `parse_functions()`
 - **Outils uv** — lazy-loaded on first tab activation via `parse_uv_tools()`
+- **Duplicates** — derived from the uv tools scan
+- **opencode** — lazy-loaded on first activation via `list_opencode_sessions()`
 
 ### Data model
 
-All entries are plain `dict`s with a `"type"` key: `"section"` | `"alias"` | `"func"` | `"tool"`. Section entries become visual separators in the table rows (rendered by `_sec_row()`). The `_current()` method returns the dict under the cursor, or `None` if the cursor is on a section row.
+All entries are plain `dict`s with a `"type"` key: `"section"` | `"alias"` | `"func"` | `"tool"` | `"session"`. Section entries become visual separators in the table rows (rendered by `_sec_row()`). The `_current()` method returns the dict under the cursor, or `None` if the cursor is on a section row. opencode session entries are the API `Session.Info` objects with an added `"type": "session"`.
 
 ### Section detection in bash files
 
@@ -52,23 +54,65 @@ Combines three sources, in this order:
 - `g` shows the result as an indented adjacency list in a `DepGraphOverlay`
 - `G` renders an interactive HTML page (blue edges = detected import, orange = declared dependency)
 
+### opencode sessions (`tab-opencode`)
+
+The opencode tab lists every root session on the machine (subagents and archived
+sessions excluded) by calling the local OpenCode API through the CLI:
+
+```bash
+opencode api GET '/api/session?limit=100&parentID=null&archived=false'
+opencode api GET '/api/session/active'
+```
+
+- Query parameters must be embedded in the path; `--param` is ignored by this
+  OpenCode version.
+- `list_opencode_sessions()` follows `cursor.next` until an empty page and
+  deduplicates by session ID.
+- Sessions are grouped by `location.directory`; groups are sorted by most recent
+  activity, and sessions inside a group by `time.updated`.
+- Running sessions are marked `⏺` using `/api/session/active`.
+- `Espace` resumes a session with `opencode --session <id>` and
+  `cwd=location.directory`. `r` reloads the list.
+- `s` opens `format_session_details()` (metadata, cost, tokens, last 5 user
+  prompts and last assistant text, fetched with `?type=user&limit=5&order=desc`
+  and the same for assistant messages).
+- `x` deletes a session after a `ConfirmOverlay`; deletion goes through
+  `DELETE /api/session/<id>` and also removes subagents.
+
+### opencode documents (`d`, `a`, `c`)
+
+`format_opencode_docs()` reads raw files (no config merging):
+
+- `a` — `AGENTS.md` from `~/.config/opencode/` plus every ancestor from the
+  session directory up to `~`; existing `CLAUDE.md` / `.claude/CLAUDE.md` files
+  are appended with a "Claude Code — non chargé par OpenCode V2" note.
+- `c` — `opencode.json` / `opencode.jsonc` from the global config directory and
+  every ancestor, direct files first then `.opencode/` files (load order).
+- `d` — both instructions and config.
+
+The overlays reuse `ReadmeOverlay(..., markup=False)` so brackets in Markdown or
+JSONC are not interpreted as Textual markup.
+
 ### Key bindings
 
 | Key | Action |
 |-----|--------|
-| `Space` | Run selected alias/function/tool (suspends TUI, runs in interactive bash, waits for Enter) |
-| `H` | Show `man` page (alias/tool) or function body (piped through `less`) |
-| `R` | Reload source files (and tools if already loaded) |
-| `t` | Toggle directory tree overlay for selected tool/project |
-| `s` | Toggle detail columns (python+path vs. install state+site-packages) |
-| `d` | Show README overlay for selected tool/project |
+| `Space` | Run selected alias/function/tool; on the opencode tab, resume the selected session |
+| `h` | Show `man` page (alias/tool), function body, or the equivalent `opencode --session` command |
+| `r` | Reload source files and, if already loaded, tools and opencode sessions |
+| `t` | Toggle directory tree overlay for the selected tool/session |
+| `s` | Toggle detail columns (tools) or show session statistics (opencode) |
+| `d` | Show README overlay (tools) or opencode documents (session) |
+| `a` | Show AGENTS.md / existing CLAUDE.md files for the selection (or cwd) |
+| `c` | Show global and project opencode.json(c) files for the selection (or cwd) |
+| `x` | Delete the selected opencode session (confirmation required) |
 | `m` / `M` | Package module structure — terminal text / HTML in browser |
 | `g` / `G` | Cross-package dependency graph — terminal text / HTML in browser |
 | `Ctrl+→` / `Ctrl+←` / `Tab` | Switch tabs |
 
 ### Modal overlays
 
-Each overlay (`DirTreeOverlay`, `ReadmeOverlay`, `SchemaOverlay`, `DepGraphOverlay`) is a `ModalScreen` with its own dismiss binding matching the key that opened it (e.g., `d` closes `ReadmeOverlay`).
+Each overlay (`DirTreeOverlay`, `ReadmeOverlay`, `SchemaOverlay`, `DepGraphOverlay`, `ConfirmOverlay`) is a `ModalScreen` with its own dismiss binding matching the key that opened it (e.g., `d` closes `ReadmeOverlay`). `ConfirmOverlay` is keyboard-only: `y`/`Enter` confirms, `n`/`Esc`/`q` cancels.
 
 ### Running alias/function entries
 

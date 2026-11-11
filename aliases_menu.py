@@ -15,22 +15,28 @@ import json
 import os
 import re
 import readline
+import shutil
 import subprocess
 import textwrap
 import tomllib
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, urlencode
+
+from rich.markup import escape
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Label, Static, TabbedContent, TabPane
 
 ALIASES_FILE   = Path.home() / ".bash_aliases"
 FUNCTIONS_FILE = Path.home() / ".bash_functions"
 UV_TOOLS_DIR   = Path.home() / ".local" / "share" / "uv" / "tools"
+OPENCODE_BIN   = shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
+OPENCODE_CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "opencode"
 # Arborescences scannées pour trouver des projets gérés par uv (pyproject.toml + uv.lock).
 # Ajoute d'autres répertoires ici si besoin.
 UV_PROJECT_DIRS = [Path.home() / "Documents" / "Python", 
@@ -93,7 +99,7 @@ _TOOL_HEADER_RE = re.compile(r"^(\S+)\s+v(\S+)\s+\[(.*?)\]\s+\((.*?)\)$")
 _TOOL_ENTRY_RE  = re.compile(r"^-\s+(\S+)\s+\((.*?)\)$")
 _SITE_PKG_NOISE = {"__pycache__", "_virtualenv.py", "_virtualenv.pth"}
 
-TAB_IDS = ["tab-alias", "tab-func", "tab-tools", "tab-dups"]
+TAB_IDS = ["tab-alias", "tab-func", "tab-tools", "tab-dups", "tab-opencode"]
 
 
 # ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -886,6 +892,336 @@ def render_dir_tree(root: Path, max_depth: int = 3, max_per_dir: int = 40) -> st
     return "\n".join(lines)
 
 
+# ─── Sessions opencode ────────────────────────────────────────────────────────
+
+def _opencode_api(method: str, path: str, cwd: Path | None = None) -> dict | None:
+    """Appelle l'API locale d'opencode via le CLI (service et auth gérés par lui).
+    Retourne le JSON décodé, {} pour une réponse vide, None en cas d'échec."""
+    try:
+        result = subprocess.run(
+            [OPENCODE_BIN, "api", method, path],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Le CLI peut précéder le JSON de quelques lignes de log.
+        start, end = raw.find("{"), raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def list_opencode_sessions() -> list[dict] | None:
+    """Toutes les sessions racines (hors sous-agents et archivées), de la plus récente
+    à la plus ancienne. None si l'API est injoignable."""
+    sessions: list[dict] = []
+    seen: set[str] = set()
+    cursor: str | None = None
+    got_response = False
+    for _ in range(20):
+        path = "/api/session?limit=100&parentID=null&archived=false"
+        if cursor:
+            path += "&cursor=" + quote(cursor, safe="")
+        data = _opencode_api("GET", path)
+        if data is None:
+            return sessions if got_response else None
+        got_response = True
+        page = data.get("data") or []
+        for s in page:
+            sid = s.get("id")
+            if sid and sid not in seen:
+                seen.add(sid)
+                s.setdefault("type", "session")
+                sessions.append(s)
+        cursor = (data.get("cursor") or {}).get("next")
+        # Le serveur renvoie parfois un curseur "next" alors que la page suivante est vide.
+        if not page or not cursor:
+            break
+    return sessions
+
+
+def list_active_sessions() -> set[str]:
+    """IDs des sessions actuellement en cours d'exécution."""
+    data = _opencode_api("GET", "/api/session/active")
+    if not data:
+        return set()
+    return {
+        sid for sid, state in (data.get("data") or {}).items()
+        if isinstance(state, dict) and state.get("type") == "running"
+    }
+
+
+def session_messages(session_id: str, **params) -> list[dict]:
+    """Messages d'une session, filtrés via les paramètres de l'API."""
+    query = urlencode(params)
+    path = f"/api/session/{session_id}/message" + (f"?{query}" if query else "")
+    data = _opencode_api("GET", path)
+    return (data or {}).get("data") or []
+
+
+def _fmt_timestamp(ms: int | float | None, fmt: str = "%d/%m/%Y %H:%M") -> str:
+    if not ms:
+        return "—"
+    try:
+        return datetime.fromtimestamp(ms / 1000).strftime(fmt)
+    except (OSError, OverflowError, ValueError):
+        return "—"
+
+
+def _humanize_since(ms: int | float | None) -> str:
+    if not ms:
+        return "—"
+    delta = datetime.now().timestamp() - ms / 1000
+    if delta < 60:
+        return "à l'instant"
+    if delta < 3600:
+        return f"il y a {int(delta // 60)} min"
+    if delta < 86400:
+        return f"il y a {int(delta // 3600)} h"
+    if delta < 2 * 86400:
+        return "hier"
+    if delta < 30 * 86400:
+        return f"il y a {int(delta // 86400)} j"
+    if delta < 365 * 86400:
+        return f"il y a {int(delta // (30 * 86400))} mois"
+    return f"il y a {int(delta // (365 * 86400))} an(s)"
+
+
+def _human_duration(ms: int | float | None) -> str:
+    if not ms or ms < 0:
+        return "—"
+    seconds = int(ms / 1000)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days} j {hours} h"
+    if hours:
+        return f"{hours} h {minutes} min"
+    return f"{max(minutes, 1)} min"
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _session_model_label(session: dict) -> str:
+    model = session.get("model") or {}
+    name = model.get("id") or "?"
+    variant = model.get("variant")
+    return f"{name} ({variant})" if variant and variant != "default" else name
+
+
+def _fmt_cost(cost: float | None) -> str:
+    return "—" if cost is None else f"${cost:.3f}"
+
+
+def _nmbr(value: int | float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{int(value):,}".replace(",", " ")
+
+
+def _message_text(message: dict) -> str:
+    """Texte visible d'un message (user ou assistant), sans raisonnement ni outils."""
+    if message.get("type") == "user":
+        return (message.get("text") or "").strip()
+    parts = [
+        (content.get("text") or "").strip()
+        for content in (message.get("content") or [])
+        if content.get("type") == "text"
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def format_session_details(session: dict) -> str:
+    """Texte de l'overlay de statistiques d'une session."""
+    model = session.get("model") or {}
+    times = session.get("time") or {}
+    tokens = session.get("tokens") or {}
+    cache = tokens.get("cache") or {}
+    created, updated = times.get("created"), times.get("updated")
+    directory = (session.get("location") or {}).get("directory") or "—"
+
+    lines = [
+        f"Identifiant : {session.get('id', '—')}",
+        f"Projet      : {directory}",
+        f"Agent       : {session.get('agent') or '—'}",
+        f"Modèle      : {model.get('providerID', '?')}/{model.get('id', '?')}"
+        + (f" ({model['variant']})" if model.get("variant") else ""),
+        f"Créée       : {_fmt_timestamp(created)}",
+        f"Modifiée    : {_fmt_timestamp(updated)}  ({_humanize_since(updated)})",
+        f"Durée       : {_human_duration(updated - created) if created and updated else '—'}",
+        f"Issue       : {session.get('outcome') or '—'}",
+        f"Coût        : {_fmt_cost(session.get('cost'))}",
+        "",
+        "Tokens",
+        f"  entrée       : {_nmbr(tokens.get('input'))}",
+        f"  sortie       : {_nmbr(tokens.get('output'))}",
+        f"  raisonnement : {_nmbr(tokens.get('reasoning'))}",
+        f"  cache lu     : {_nmbr(cache.get('read'))}",
+        f"  cache écrit  : {_nmbr(cache.get('write'))}",
+    ]
+
+    users = session_messages(session["id"], type="user", limit=5, order="desc")
+    assistants = session_messages(session["id"], type="assistant", limit=5, order="desc")
+
+    if users:
+        lines += ["", "Derniers prompts"]
+        for msg in users:
+            text = _message_text(msg)
+            if text:
+                lines.append(
+                    f"  • {_fmt_timestamp((msg.get('time') or {}).get('created'), '%d/%m %H:%M')}"
+                    f" — {_truncate(text, 180)}"
+                )
+
+    last_answer = ""
+    for msg in assistants:
+        last_answer = _message_text(msg)
+        if last_answer:
+            break
+    if last_answer:
+        lines += ["", "Dernière réponse", textwrap.indent(last_answer[:1200], "  ")]
+
+    return "\n".join(lines)
+
+
+def _tilde(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def _ancestor_dirs(start: Path, stop_at_home: bool = True) -> list[Path]:
+    """Dossier de départ puis ses ancêtres, jusqu'à ~ (ou la racine)."""
+    try:
+        current = start.resolve()
+    except OSError:
+        current = start
+    home = Path.home().resolve()
+    directories: list[Path] = []
+    while True:
+        directories.append(current)
+        if current == current.parent or (stop_at_home and current == home):
+            break
+        current = current.parent
+    return directories
+
+
+def _dedup_paths(items: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    seen: set[Path] = set()
+    out: list[tuple[str, Path]] = []
+    for label, path in items:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append((label, path))
+    return out
+
+
+def find_agents_files(directory: Path) -> list[tuple[str, Path]]:
+    """AGENTS.md global puis ceux du dossier de travail vers ~."""
+    items: list[tuple[str, Path]] = []
+    global_file = OPENCODE_CONFIG_DIR / "AGENTS.md"
+    if global_file.is_file():
+        items.append(("Global", global_file))
+    for d in _ancestor_dirs(directory):
+        candidate = d / "AGENTS.md"
+        if candidate.is_file():
+            items.append(("Projet", candidate))
+    return _dedup_paths(items)
+
+
+def find_claude_files(directory: Path) -> list[tuple[str, Path]]:
+    """CLAUDE.md de Claude Code, uniquement s'ils existent (non chargés par OpenCode V2)."""
+    items: list[tuple[str, Path]] = []
+    global_file = Path.home() / ".claude" / "CLAUDE.md"
+    if global_file.is_file():
+        items.append(("Claude Code global", global_file))
+    for d in _ancestor_dirs(directory):
+        for candidate in (d / "CLAUDE.md", d / ".claude" / "CLAUDE.md"):
+            if candidate.is_file():
+                items.append(("Claude Code", candidate))
+    return _dedup_paths(items)
+
+
+def find_opencode_configs(directory: Path) -> list[tuple[str, Path]]:
+    """Fichiers opencode.json(c) chargés, du moins prioritaire au plus prioritaire."""
+    items: list[tuple[str, Path]] = []
+    try:
+        current_dir = directory.resolve()
+    except OSError:
+        current_dir = directory
+    for name in ("opencode.json", "opencode.jsonc"):
+        candidate = OPENCODE_CONFIG_DIR / name
+        if candidate.is_file():
+            items.append(("Global", candidate))
+
+    ancestors = list(reversed(_ancestor_dirs(directory, stop_at_home=False)))  # racine → dossier courant
+    for d in ancestors:
+        for name in ("opencode.json", "opencode.jsonc"):
+            candidate = d / name
+            if candidate.is_file():
+                label = "Projet" if d == current_dir else "Projet (parent)"
+                items.append((label, candidate))
+    for d in ancestors:
+        for name in ("opencode.json", "opencode.jsonc"):
+            candidate = d / ".opencode" / name
+            if candidate.is_file():
+                label = "Projet .opencode" if d == current_dir else "Projet .opencode (parent)"
+                items.append((label, candidate))
+    return _dedup_paths(items)
+
+
+def _format_files(items: list[tuple[str, Path]], empty_message: str) -> str:
+    if not items:
+        return empty_message
+    blocks: list[str] = []
+    for label, path in items:
+        try:
+            content = path.read_text(errors="replace").rstrip()
+        except OSError as exc:
+            content = f"(illisible : {exc})"
+        blocks.append(f"═══ {label} — {_tilde(path)} ═══\n\n{content}")
+    return "\n\n\n".join(blocks)
+
+
+def format_opencode_docs(directory: Path, *, instructions: bool = True,
+                         config: bool = True) -> str:
+    items: list[tuple[str, Path]] = []
+    if instructions:
+        items += find_agents_files(directory)
+        items += find_claude_files(directory)
+    if config:
+        items += find_opencode_configs(directory)
+    if instructions and config:
+        empty = f"(aucun AGENTS.md / CLAUDE.md / opencode.json trouvé pour {_tilde(directory)})"
+    elif instructions:
+        empty = f"(aucun AGENTS.md / CLAUDE.md trouvé pour {_tilde(directory)})"
+    else:
+        empty = f"(aucun opencode.json / opencode.jsonc trouvé pour {_tilde(directory)})"
+    return _format_files(items, empty)
+
+
 # ─── README & schéma Mermaid ───────────────────────────────────────────────────
 
 _README_NAMES = ("README.md", "README.rst", "README.txt", "README")
@@ -1493,10 +1829,13 @@ class DirTreeOverlay(ModalScreen):
 
 
 class ReadmeOverlay(ModalScreen):
-    """Affiche le README d'un outil/projet par-dessus la liste."""
+    """Affiche un texte (README, stats de session, documents) par-dessus la liste."""
 
     BINDINGS = [
         Binding("d",      "dismiss_overlay", "Fermer", show=True),
+        Binding("s",      "dismiss_overlay", "Fermer", show=False),
+        Binding("a",      "dismiss_overlay", "Fermer", show=False),
+        Binding("c",      "dismiss_overlay", "Fermer", show=False),
         Binding("escape", "dismiss_overlay", "Fermer", show=True),
         Binding("q",      "dismiss_overlay", "Fermer", show=False),
     ]
@@ -1513,19 +1852,63 @@ class ReadmeOverlay(ModalScreen):
     #readme-title { text-style: bold; color: $accent; padding-bottom: 1; }
     """
 
-    def __init__(self, title: str, readme_text: str) -> None:
+    def __init__(self, title: str, readme_text: str,
+                 markup: bool = True, hint: str = "d") -> None:
         super().__init__()
         self._title = title
         self._readme_text = readme_text
+        self._markup = markup
+        self._hint = hint
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="readme-panel"):
             yield Static(f"[bold bright_cyan]{self._title}[/bold bright_cyan]  "
-                         f"[dim]( d / Échap pour fermer )[/dim]", id="readme-title")
-            yield Static(self._readme_text)
+                         f"[dim]( {self._hint} / Échap pour fermer )[/dim]", id="readme-title")
+            yield Static(self._readme_text, markup=self._markup)
 
     def action_dismiss_overlay(self) -> None:
         self.dismiss()
+
+
+class ConfirmOverlay(ModalScreen):
+    """Confirmation clavier pour les actions destructrices."""
+
+    BINDINGS = [
+        Binding("y",      "confirm", "Oui",     show=True),
+        Binding("enter",  "confirm", "Oui",     show=True),
+        Binding("n",      "cancel",  "Non",     show=True),
+        Binding("escape", "cancel",  "Non",     show=True),
+        Binding("q",      "cancel",  "Non",     show=False),
+    ]
+
+    CSS = """
+    ConfirmOverlay { align: center middle; }
+    #confirm-panel {
+        width: 70%;
+        height: auto;
+        border: thick $error;
+        background: $panel;
+        padding: 1 2;
+    }
+    #confirm-title { text-style: bold; color: $error; padding-bottom: 1; }
+    """
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-panel"):
+            yield Static(f"[bold bright_red]{self._title}[/bold bright_red]", id="confirm-title")
+            yield Static(self._body, markup=False)
+            yield Static("[dim]y / Entrée = confirmer  ·  n / Échap = annuler[/dim]")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class SchemaOverlay(ModalScreen):
@@ -1643,7 +2026,10 @@ class AliasMenu(App):
         Binding("r",          "reload",     "Recharger",    show=True),
         Binding("t",          "toggle_view",   "Arbre",   show=True),
         Binding("s",          "toggle_detail", "Détails", show=True),
-        Binding("d",          "show_doc",      "README", show=True),
+        Binding("d",          "show_doc",      "Docs", show=True),
+        Binding("a",          "show_agents",   "AGENTS.md", show=False),
+        Binding("c",          "show_opencode_config", "opencode.json", show=False),
+        Binding("x",          "delete_session", "Supprimer la session", show=False),
         Binding("m",          "show_mermaid",      "Pkg (M:HTML)", show=True),
         Binding("M",          "show_mermaid_html", "Structure interne (HTML)", show=False),
         Binding("g",          "show_dep_graph_terminal", "Deps (G:HTML)", show=True),
@@ -1667,7 +2053,9 @@ class AliasMenu(App):
                 yield DataTable(id="tools-table", zebra_stripes=True, cursor_type="row")
             with TabPane("  Duplicates  ", id="tab-dups"):
                 yield DataTable(id="dups-table", zebra_stripes=True, cursor_type="row")
-        yield Label("", id="status")
+            with TabPane("  opencode  ", id="tab-opencode"):
+                yield DataTable(id="sessions-table", zebra_stripes=True, cursor_type="row")
+        yield Label("", id="status", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1675,12 +2063,18 @@ class AliasMenu(App):
         self._load_functions()
         self.tools_entries: list[dict] = []
         self.dups_entries:  list[dict] = []
+        self.sessions_entries: list[dict] = []
         self._tool_rows: list[dict | None] = []
         self._dup_rows:  list[dict | None] = []
+        self._session_rows: list[dict | None] = []
         self._tools_loaded = False
         self._tools_detail = False
+        self._sessions_loaded = False
+        self._sessions_active: set[str] = set()
+        self._sessions_error: str | None = None
         self._init_tools_placeholder()
         self._init_dups_placeholder()
+        self._init_sessions_placeholder()
         self.query_one("#alias-table", DataTable).focus()
 
     def _init_tools_placeholder(self) -> None:
@@ -1694,6 +2088,21 @@ class AliasMenu(App):
         t.clear(columns=True)
         t.add_columns("Raison", "Outil", "Version", "Canonique", "Arborescence")
         t.add_row("[dim]Active l'onglet packages pip/uv pour charger…[/dim]", "", "", "", "")
+
+    def _init_sessions_placeholder(self) -> None:
+        t = self.query_one("#sessions-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("  ▶  ", "Titre", "Agent · Modèle", "Modifié", "Coût")
+        t.add_row("", "[dim]Active cet onglet pour charger les sessions opencode…[/dim]", "", "", "")
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Désactive les raccourcis de l'app tant qu'un overlay modal est ouvert.
+
+        Les bindings propres au ModalScreen (fermeture, confirmation…) restent actifs.
+        """
+        if len(self.screen_stack) > 1:
+            return False
+        return True
 
     # ── tab switching ────────────────────────────────────────────────────────
 
@@ -1749,6 +2158,11 @@ class AliasMenu(App):
                 f"{n} doublon(s) filtré(s)  ·  "
                 f"[SPC] dolphin (vue scindée)  ·  [t] arbres comparés côte à côte"
             )
+        elif active == "tab-opencode":
+            self.query_one("#sessions-table", DataTable).focus()
+            if not self._sessions_loaded:
+                self._load_sessions()
+            self._session_status()
 
     # ── loaders ─────────────────────────────────────────────────────────────
 
@@ -1890,6 +2304,120 @@ class AliasMenu(App):
                 )
                 self._dup_rows.append(e)
 
+    # ── opencode sessions loader ─────────────────────────────────────────────
+
+    def _load_sessions(self) -> None:
+        selected_id = None
+        if self._sessions_loaded and self._active_tab() == "tab-opencode":
+            current = self._current()
+            if current:
+                selected_id = current.get("id")
+        self._sessions_loaded = True
+        self._sessions_error = None
+        self._status("Chargement des sessions opencode…")
+        if Path(OPENCODE_BIN).exists():
+            sessions = list_opencode_sessions()
+        else:
+            sessions = None
+            self._sessions_error = (
+                f"opencode introuvable ({OPENCODE_BIN}) — vérifie l'installation, puis [r]."
+            )
+        if sessions is None:
+            if not self._sessions_error:
+                self._sessions_error = (
+                    "Service opencode injoignable — vérifie `opencode api GET /api/info`, puis [r]."
+                )
+            self.sessions_entries = []
+            self._sessions_active = set()
+        else:
+            self.sessions_entries = sessions
+            self._sessions_active = list_active_sessions()
+        self._render_sessions_table()
+        if selected_id:
+            table = self.query_one("#sessions-table", DataTable)
+            for index, row in enumerate(self._session_rows):
+                if row and row.get("id") == selected_id:
+                    table.move_cursor(row=index)
+                    break
+        if self._active_tab() == "tab-opencode":
+            self._session_status()
+
+    def _render_sessions_table(self) -> None:
+        t = self.query_one("#sessions-table", DataTable)
+        t.clear(columns=True)
+        t.add_columns("  ▶  ", "Titre", "Agent · Modèle", "Modifié", "Coût")
+        self._session_rows = []
+
+        if self._sessions_error:
+            t.add_row("", f"[dim]{escape(self._sessions_error)}[/dim]", "", "", "")
+            self._session_rows.append(None)
+            return
+
+        if not self.sessions_entries:
+            t.add_row("", "[dim]Aucune session opencode trouvée.[/dim]", "", "", "")
+            self._session_rows.append(None)
+            return
+
+        groups: dict[str, list[dict]] = {}
+        for session in self.sessions_entries:
+            directory = (session.get("location") or {}).get("directory") or "?"
+            groups.setdefault(directory, []).append(session)
+
+        def latest_activity(items: list[dict]) -> int | float:
+            return max(((s.get("time") or {}).get("updated") or 0) for s in items)
+
+        for directory, group in sorted(
+            groups.items(), key=lambda item: latest_activity(item[1]), reverse=True
+        ):
+            group.sort(
+                key=lambda s: (s.get("time") or {}).get("updated") or 0, reverse=True
+            )
+            label = _short_path(directory) or directory
+            t.add_row(
+                "",
+                f"[bold bright_cyan]  ◆  {escape(label)}[/bold bright_cyan]"
+                f"[dim]  ({len(group)} session(s))[/dim]",
+                "[dim cyan]" + "─" * 20 + "[/dim cyan]",
+                "", "",
+                key=f"ssh{len(self._session_rows)}",
+            )
+            self._session_rows.append(None)
+
+            for session in group:
+                session_id = session.get("id") or ""
+                active = session_id in self._sessions_active
+                title = escape(_truncate(session.get("title") or "(sans titre)", 68))
+                if active:
+                    title = "[bold green]⏺[/bold green] " + title
+                updated = _humanize_since((session.get("time") or {}).get("updated"))
+                t.add_row(
+                    "[bold green] [SPC] [/bold green]",
+                    title,
+                    f"[dim]{escape(_session_model_label(session))}[/dim]",
+                    f"[dim]{updated}[/dim]",
+                    f"[dim]{_fmt_cost(session.get('cost'))}[/dim]",
+                    key=f"s{len(self._session_rows)}",
+                )
+                self._session_rows.append(session)
+
+    def _session_status(self) -> None:
+        if self._sessions_error:
+            self._status(self._sessions_error)
+            return
+        sessions = self.sessions_entries
+        n = len(sessions)
+        n_active = sum(1 for s in sessions if s.get("id") in self._sessions_active)
+        projects = {
+            (s.get("location") or {}).get("directory")
+            for s in sessions
+            if (s.get("location") or {}).get("directory")
+        }
+        self._status(
+            f"{n} session(s) · {n_active} active(s) · {len(projects)} projet(s)  ·  "
+            f"[Espace] reprendre  ·  [s] stats  ·  [d] docs  ·  "
+            f"[a] AGENTS.md  ·  [c] opencode.json  ·  [t] arbre  ·  [x] supprimer"
+        )
+
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _status(self, msg: str) -> None:
@@ -1920,6 +2448,13 @@ class AliasMenu(App):
                 return self._dup_rows[row]
             return None
 
+        if active == "tab-opencode":
+            t = self.query_one("#sessions-table", DataTable)
+            row = t.cursor_row
+            if 0 <= row < len(self._session_rows):
+                return self._session_rows[row]
+            return None
+
         t = self.query_one("#tools-table", DataTable)
         row = t.cursor_row
         if 0 <= row < len(self._tool_rows):
@@ -1930,6 +2465,11 @@ class AliasMenu(App):
 
     def action_run_entry(self) -> None:
         active = self._active_tab()
+        if active == "tab-opencode":
+            entry = self._current()
+            if entry:
+                self._resume_session(entry)
+            return
         if active == "tab-dups":
             entry = self._current()
             if entry:
@@ -2027,11 +2567,105 @@ class AliasMenu(App):
                 subprocess.run(["bash", "-i", "-c", cmd])
                 input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
 
+    # ── action : sessions opencode ──────────────────────────────────────────
+
+    def _resume_session(self, session: dict) -> None:
+        session_id = session.get("id")
+        directory = (session.get("location") or {}).get("directory")
+        if not session_id:
+            return
+        if not directory or not Path(directory).is_dir():
+            self._status(f"Répertoire introuvable : {directory or '?'}")
+            return
+        title = session.get("title") or session_id
+        self._status(f"Reprise de la session : {title}")
+        with self.suspend():
+            try:
+                result = subprocess.run(
+                    [OPENCODE_BIN, "--session", session_id], cwd=directory
+                )
+                returncode = result.returncode
+            except FileNotFoundError:
+                print("\n\033[31mopencode introuvable — vérifie son installation.\033[0m")
+                input("\n\033[2m[ Appuyez sur Entrée pour revenir au menu ]\033[0m")
+                returncode = 127
+        if returncode == 0:
+            self._status(f"Session fermée : {title}")
+        else:
+            self._status(f"opencode terminé avec le code {returncode}")
+
+    def _docs_context_dir(self) -> Path | None:
+        """Dossier de référence pour AGENTS/CLAUDE/config : sélection courante ou cwd."""
+        active = self._active_tab()
+        entry = self._current()
+        if active == "tab-opencode" and entry:
+            directory = (entry.get("location") or {}).get("directory")
+            return Path(directory) if directory else None
+        if active in ("tab-tools", "tab-dups") and entry:
+            return Path(entry["tool_dir"])
+        return Path.cwd()
+
+    def action_show_agents(self) -> None:
+        directory = self._docs_context_dir()
+        if directory is None:
+            self._status("Sélectionne une session pour afficher ses AGENTS.md")
+            return
+        text = format_opencode_docs(directory, instructions=True, config=False)
+        title = escape(f"◆ AGENTS.md / CLAUDE.md — {_short_path(directory)}")
+        self.push_screen(ReadmeOverlay(title, text, markup=False, hint="a"))
+
+    def action_show_opencode_config(self) -> None:
+        directory = self._docs_context_dir()
+        if directory is None:
+            self._status("Sélectionne une session pour afficher sa configuration")
+            return
+        text = format_opencode_docs(directory, instructions=False, config=True)
+        title = escape(f"◆ opencode.json — {_short_path(directory)}")
+        self.push_screen(ReadmeOverlay(title, text, markup=False, hint="c"))
+
+    def action_delete_session(self) -> None:
+        if self._active_tab() != "tab-opencode":
+            return
+        entry = self._current()
+        if not entry:
+            self._status("Sélectionne une session à supprimer")
+            return
+        title = entry.get("title") or entry.get("id", "?")
+        directory = (entry.get("location") or {}).get("directory") or "?"
+        body = (
+            f"{title}\n"
+            f"{entry.get('id', '?')}\n"
+            f"{directory}\n\n"
+            f"Cette action supprime aussi les éventuels sous-agents."
+        )
+        self.push_screen(
+            ConfirmOverlay("Supprimer définitivement cette session ?", body),
+            lambda confirmed: self._delete_session(entry) if confirmed else None,
+        )
+
+    def _delete_session(self, session: dict) -> None:
+        session_id = session.get("id")
+        if not session_id:
+            return
+        if _opencode_api("DELETE", f"/api/session/{session_id}") is None:
+            self._status("Échec de la suppression — session conservée")
+            return
+        title = session.get("title") or session_id
+        self._load_sessions()
+        self._status(f"Session supprimée : {title}")
+
     # ── action : man / help ─────────────────────────────────────────────────
 
     def action_show_help(self) -> None:
         entry = self._current()
         if not entry:
+            return
+
+        if entry.get("type") == "session":
+            directory = (entry.get("location") or {}).get("directory") or "?"
+            self._status(
+                f"cd '{directory}' && opencode --session {entry.get('id', '?')}"
+            )
             return
 
         if entry["type"] == "alias":
@@ -2076,6 +2710,19 @@ class AliasMenu(App):
 
     def action_toggle_view(self) -> None:
         active = self._active_tab()
+        if active == "tab-opencode":
+            entry = self._current()
+            if not entry:
+                self._status("Sélectionne une session pour voir son arbre de répertoire")
+                return
+            directory = (entry.get("location") or {}).get("directory")
+            if not directory or not Path(directory).is_dir():
+                self._status(f"Répertoire introuvable : {directory or '?'}")
+                return
+            target_dir = Path(directory)
+            title = escape(f"◆ {entry.get('title') or 'session'}  —  {_short_path(target_dir)}")
+            self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
+            return
         if active not in ("tab-tools", "tab-dups") or not self._tools_loaded:
             return
         entry = self._current()
@@ -2099,6 +2746,16 @@ class AliasMenu(App):
         self.push_screen(DirTreeOverlay(title, render_dir_tree(target_dir)))
 
     def action_toggle_detail(self) -> None:
+        if self._active_tab() == "tab-opencode":
+            entry = self._current()
+            if not entry:
+                self._status("Sélectionne une session pour afficher ses statistiques")
+                return
+            self._status("Lecture des derniers échanges…")
+            body = format_session_details(entry)
+            title = escape(f"◆ Session — {entry.get('title') or entry.get('id')}")
+            self.push_screen(ReadmeOverlay(title, body, markup=False, hint="s"))
+            return
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
         self._tools_detail = not self._tools_detail
@@ -2106,6 +2763,19 @@ class AliasMenu(App):
         self._status("Détails : " + ("état + structure" if self._tools_detail else "python + chemin"))
 
     def action_show_doc(self) -> None:
+        if self._active_tab() == "tab-opencode":
+            entry = self._current()
+            if not entry:
+                self._status("Sélectionne une session pour afficher ses documents")
+                return
+            directory = (entry.get("location") or {}).get("directory")
+            if not directory:
+                self._status("Session sans répertoire de travail")
+                return
+            text = format_opencode_docs(Path(directory), instructions=True, config=True)
+            title = escape(f"◆ {entry.get('title') or 'session'}  —  documents opencode")
+            self.push_screen(ReadmeOverlay(title, text, markup=False, hint="d"))
+            return
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
             return
         entry = self._current()
@@ -2122,7 +2792,7 @@ class AliasMenu(App):
                 text = readme.read_text(errors="replace")
             except OSError:
                 text = "(impossible de lire le fichier)"
-        self.push_screen(ReadmeOverlay(title, text))
+        self.push_screen(ReadmeOverlay(title, text, markup=False))
 
     def action_show_mermaid(self) -> None:
         if self._active_tab() != "tab-tools" or not self._tools_loaded:
@@ -2202,10 +2872,15 @@ class AliasMenu(App):
     # ── action : reload ─────────────────────────────────────────────────────
 
     def action_reload(self) -> None:
+        if self._active_tab() == "tab-opencode":
+            self._load_sessions()
+            return
         self._load_aliases()
         self._load_functions()
         if self._tools_loaded:
             self._load_tools()
+        if self._sessions_loaded:
+            self._load_sessions()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
